@@ -1,5 +1,6 @@
 #include "sc_resolver.h"
 #include "sig_scanner.h"
+#include "steam_engine_layout.h"
 #include "log.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -94,57 +95,88 @@ static uintptr_t ResolveServiceTransportVtable() {
 }
 
 // ── Global engine pointer ─────────────────────────────────────────────
-// Approach: FlushAppMinutesPlayed at +0x09 loads g_pCSteamEngine via
-// `mov rax, cs:[rip+disp]`. We can also scan for `lea rcx/rbx, [reg+0xE68]`
-// (CAppInfoCache offset) and backwalk to the preceding mov from global.
-// The CAppInfoCache approach is more generic and doesn't depend on any
-// single function existing.
-
-static uintptr_t ResolveGlobalEngine(uintptr_t scBase) {
-    // Strategy A: scan for `lea rcx, [reg+0xE68]` pattern (CAppInfoCache offset)
-    // Pattern bytes: 48 8D 89 68 0E 00 00 (lea rcx,[rcx+0xE68])
-    //           or:  48 8D 8B 68 0E 00 00 (lea rcx,[rbx+0xE68])
-    // ModR/M byte 89=rcx+rcx, 8B=rcx+rbx, 8F=rcx+rdi, 8E=rcx+rsi
-    // We use wildcard on the ModR/M to catch any source register:
-    //   48 8D ?? 68 0E 00 00  where byte[2] & 0xC7 == 0x81 (disp32 + base reg)
-    // Actually simpler: the 4-byte immediate 68 0E 00 00 (=0xE68) is distinctive.
-
-    // Scan for any `lea reg, [reg + 0x00000E68]` -- 7-byte form with disp32
-    // The full pattern is: REX 8D ModRM disp32
-    // REX = 48 or 4C; opcode = 8D; ModRM & 0xC0 == 0x80 (mod=10 = disp32)
-    // and disp = 0x00000E68.
+// Resolve the global and cache displacement together from actual UFS quota
+// readers. A stale layout constant must not prevent discovery (or be combined
+// with a newly discovered global).
+static void ResolveGlobalEngine(uintptr_t scBase, ResolvedAddrs& r) {
+    using namespace SteamEngineLayout;
     const auto* text = reinterpret_cast<const uint8_t*>(SigScanner::GetTextBase());
-    size_t textSize = SigScanner::GetTextSize();
-
+    const size_t textSize = SigScanner::GetTextSize();
+    const uintptr_t data = SigScanner::GetDataBase();
+    const uintptr_t dataEnd = data + SigScanner::GetDataSize();
+    const uintptr_t rdata = SigScanner::GetRdataBase();
+    const uintptr_t rdataEnd = rdata + SigScanner::GetRdataSize();
+    KvReference agreed;
+    unsigned keys = 0, matches = 0;
     __try {
-        for (size_t i = 0; i + 7 <= textSize; ++i) {
-            if ((text[i] == 0x48 || text[i] == 0x4C) && text[i+1] == 0x8D &&
-                (text[i+2] & 0xC0) == 0x80) {
-                // Check disp32 == 0xE68
-                int32_t disp = *reinterpret_cast<const int32_t*>(text + i + 3);
-                if (disp != 0xE68) continue;
-
-                uintptr_t leaAddr = SigScanner::GetTextBase() + i;
-
-                // Walk backward up to 40 bytes looking for `mov reg, [rip+disp]`
-                for (int back = 7; back <= 40; ++back) {
-                    uintptr_t candidate = leaAddr - back;
-                    if (candidate < SigScanner::GetTextBase()) break;
-                    uintptr_t global = SigScanner::DecodeRipRelMov(candidate);
-                    if (global && global >= SigScanner::GetDataBase() &&
-                        global < SigScanner::GetDataBase() + SigScanner::GetDataSize()) {
-                        LOG("[Resolver] GlobalEngine @ %p (RVA 0x%llX) via lea+0xE68 backwalk",
-                            (void*)global, (uint64_t)(global - scBase));
-                        return global;
-                    }
-                }
-                // Try next lea+0xE68 occurrence if backwalk failed
+        for (size_t i = 0; i + 7 <= textSize && r.readConfigU64; ++i) {
+            KvReference candidate;
+            if (!DecodeKvReference(text + i, textSize - i,
+                                   SigScanner::GetTextBase() + i, r.readConfigU64, candidate)) continue;
+            if (candidate.global < data || candidate.global + sizeof(void*) > dataEnd ||
+                candidate.global % alignof(void*) || candidate.key < rdata ||
+                candidate.key >= rdataEnd) continue;
+            unsigned key = 0;
+            if (rdataEnd - candidate.key >= 6 && !std::memcmp((void*)candidate.key, "quota", 6)) key = 1;
+            if (rdataEnd - candidate.key >= 12 && !std::memcmp((void*)candidate.key, "maxnumfiles", 12)) key = 2;
+            if (!key) continue;
+            if (matches && (agreed.global != candidate.global || agreed.cache != candidate.cache)) {
+                LOG("[Resolver] GlobalEngine: conflicting UFS readers; disabled");
+                return;
             }
+            agreed = candidate;
+            keys |= key;
+            ++matches;
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (matches < 2 || keys != 3) {
+        LOG("[Resolver] GlobalEngine: no agreeing quota/maxnumfiles readers; disabled");
+        return;
+    }
+    r.globalEngine = agreed.global;
+    r.engineOffAppInfoCache = agreed.cache;
+    LOG("[Resolver] GlobalEngine @ %p (RVA 0x%llX), AppInfoCache=0x%X via %u UFS readers",
+        (void*)r.globalEngine, (uint64_t)(r.globalEngine - scBase), r.engineOffAppInfoCache, matches);
+}
 
-    LOG("[Resolver] GlobalEngine: all strategies failed");
-    return 0;
+static void ResolveCurrentUserOffsets(ResolvedAddrs& r) {
+    using namespace SteamEngineLayout;
+    if (!r.globalEngine || !r.engineOffAppInfoCache) return;
+    const uintptr_t base = SigScanner::GetTextBase();
+    const size_t size = SigScanner::GetTextSize();
+    const auto* text = reinterpret_cast<const uint8_t*>(base);
+    uint32_t agreedHandle = 0, agreedMap = 0;
+    unsigned matches = 0;
+    __try {
+        for (size_t i = 0; i + 14 <= size; ++i) {
+            // mov edx,[rcx+handle]; call lookup; test rax,rax. RCX is
+            // unchanged between reading the engine handle and the lookup.
+            const auto* p = text + i;
+            if (p[0] != 0x8B || p[1] != 0x91 || p[6] != 0xE8 ||
+                std::memcmp(p + 11, "\x48\x85\xC0", 3)) continue;
+            const uint32_t handle = U32(p + 2);
+            const uintptr_t target = Relative(base + i + 11, p + 7);
+            if (target < base || target - base >= size) continue;
+            uint32_t map = 0;
+            if (!DecodeUserMap(reinterpret_cast<const uint8_t*>(target), size - (target - base), map) ||
+                !Offset(handle) || handle >= map || map + 40 >= r.engineOffAppInfoCache) continue;
+            if (matches && (handle != agreedHandle || map != agreedMap)) {
+                LOG("[Resolver] CurrentUser: conflicting accessors; disabled");
+                return;
+            }
+            agreedHandle = handle;
+            agreedMap = map;
+            ++matches;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (matches < 2) {
+        LOG("[Resolver] CurrentUser: insufficient validated accessors; disabled");
+        return;
+    }
+    r.engineOffGlobalHandle = agreedHandle;
+    r.engineOffUserMap = agreedMap;
+    LOG("[Resolver] CurrentUser: handle=0x%X map=0x%X via %u accessors",
+        agreedHandle, agreedMap, matches);
 }
 
 // ── Protobuf helpers ──────────────────────────────────────────────────
@@ -605,8 +637,13 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
     r.ccmInterfaceVtable = ResolveCCMInterfaceVtable();
     r.serviceTransportVtable = ResolveServiceTransportVtable();
 
-    // Phase 2: Global engine pointer
-    r.globalEngine = ResolveGlobalEngine(steamClientBase);
+    // Resolve the KV read chain before deriving the engine/cache pair from
+    // its callers. No engine pointer is dereferenced during resolution.
+    r.getAppInfo    = ResolveGetAppInfo();
+    r.getSection    = ResolveGetSection();
+    r.readConfigU64 = ResolveReadConfigU64(r.getAppInfo);
+    ResolveGlobalEngine(steamClientBase, r);
+    ResolveCurrentUserOffsets(r);
 
     // Phase 3: Protobuf helpers (signature-based)
     r.serializeToArray = ResolveSerializeToArray();
@@ -682,11 +719,6 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
     r.kvSetUint64  = ResolveKvSetUint64();
     r.kvSetInt     = ResolveKvSetInt();
     r.kvSetString  = ResolveKvSetString();
-
-    // Phase 9: AppInfo functions (signature-based, ReadConfigU64 anchored to GetAppInfo)
-    r.getAppInfo     = ResolveGetAppInfo();
-    r.getSection     = ResolveGetSection();
-    r.readConfigU64  = ResolveReadConfigU64(r.getAppInfo);
 
     // Phase 10: BAsyncSend (string xref — unique "CProtoBufMsg::BAsyncSend")
     r.bAsyncSend = ResolveFuncByStringXref(
@@ -1007,13 +1039,8 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
         }
     }
 
-    // Phase 19: Struct offsets (leave at 0 -- use hardcoded fallbacks for now)
-    r.engineOffJobMgr       = 0;
-    r.engineOffGlobalHandle = 0;
-    r.engineOffUserMap      = 0;
-    r.ccmOffConnContext     = 0;
-    r.userOffCcmInterface   = 0;
-    r.engineOffAppInfoCache = 0xE68;
+    // Unvalidated optional layouts remain zero. Consumers must gate these
+    // subsystems instead of applying offsets from a previous Steam build.
 
     LOG("[Resolver] === Auto-resolution complete ===");
     return r;

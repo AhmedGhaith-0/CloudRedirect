@@ -488,6 +488,18 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/pending_ops_journal_tests.cpp
 endif()
 
 # ── Fork tests (tests-fork/) ────────────────────────────────────────────
+add_executable(steam_message_layout_tests tests-fork/steam_message_layout_tests.cpp)
+target_include_directories(steam_message_layout_tests PRIVATE src/platform/win)
+add_test(NAME steam_message_layout_tests COMMAND steam_message_layout_tests)
+
+add_executable(steam_resolver_tests tests-fork/steam_resolver_tests.cpp)
+target_include_directories(steam_resolver_tests PRIVATE src/platform/win)
+if(WIN32)
+    target_sources(steam_resolver_tests PRIVATE
+        src/platform/win/sc_resolver.cpp src/platform/win/sig_scanner.cpp)
+endif()
+add_test(NAME steam_resolver_tests COMMAND steam_resolver_tests)
+
 add_executable(autocloud_injection_tests tests-fork/autocloud_injection_tests.cpp)
 target_include_directories(autocloud_injection_tests PRIVATE src/common)
 if(WIN32)

@@ -9,6 +9,7 @@
 #include "steam_kv_injector.h"
 #include "sc_resolver.h"
 #include "sig_scanner.h"
+#include "steam_message_layout.h"
 #include "log.h"
 #include "http_server.h"
 #include "vdf.h"
@@ -326,6 +327,26 @@ static uintptr_t g_steamClientBase = 0;           // steamclient64.dll base addr
 // Populated once in RunAutoResolver(). Zero = not resolved (use hardcoded fallback).
 static ScResolver::ResolvedAddrs g_resolved = {};
 static std::atomic<bool> g_resolverRan{false};
+static SteamMessageLayout::Layout g_messageLayout;
+
+static void* MessageHeader(const void* wrapper) {
+    return SteamMessageLayout::Header(wrapper, g_messageLayout);
+}
+static void* MessageBody(const void* wrapper) {
+    return SteamMessageLayout::Body(wrapper, g_messageLayout);
+}
+
+static bool ResolveMessageLayout(uintptr_t slot5, uintptr_t slot8) {
+    constexpr size_t kAdapterBytes = 0x100;
+    const uintptr_t text = SigScanner::GetTextBase();
+    const uintptr_t end = text + SigScanner::GetTextSize();
+    if (slot5 < text || slot5 > end || end - slot5 < kAdapterBytes ||
+        slot8 < text || slot8 > end || end - slot8 < kAdapterBytes) return false;
+    __try {
+        return SteamMessageLayout::Resolve(reinterpret_cast<const uint8_t*>(slot5), kAdapterBytes,
+            reinterpret_cast<const uint8_t*>(slot8), kAdapterBytes, g_messageLayout);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
 
 // Use resolved address if available, else 0 (subsystem must gate on this).
 // No hardcoded fallback — a wrong RVA causes silent corruption or crashes.
@@ -635,18 +656,18 @@ static uintptr_t FindCurrentUser() {
     }
 
     uintptr_t engineGlobal = SC_RESOLVE(globalEngine);
-    if (!engineGlobal) return 0;
+    if (!engineGlobal || !g_resolved.engineOffGlobalHandle || !g_resolved.engineOffUserMap) return 0;
     uintptr_t* pEngineGlobal = (uintptr_t*)engineGlobal;
     uintptr_t engine = 0;
     __try { engine = *pEngineGlobal; } __except(EXCEPTION_EXECUTE_HANDLER) { return 0; }
     if (!engine) return 0;
 
     uint32_t globalHandle = 0;
-    __try { globalHandle = *(uint32_t*)(engine + ENGINE_OFF_GLOBAL_HANDLE); }
+    __try { globalHandle = *(uint32_t*)(engine + g_resolved.engineOffGlobalHandle); }
     __except(EXCEPTION_EXECUTE_HANDLER) { return 0; }
     if (globalHandle == 0) return 0;
 
-    uintptr_t userMapBase = engine + ENGINE_OFF_USER_MAP;
+    uintptr_t userMapBase = engine + g_resolved.engineOffUserMap;
     uintptr_t arrayPtr = 0;
     int32_t count = 0;
     __try {
@@ -1065,7 +1086,7 @@ static void TryFindCCMInterface() {
     __try {
         uintptr_t* pEngineGlobal = (uintptr_t*)SC_RESOLVE(globalEngine);
         uintptr_t engine = *pEngineGlobal;
-        uint32_t handle = *(uint32_t*)(engine + ENGINE_OFF_GLOBAL_HANDLE);
+        uint32_t handle = *(uint32_t*)(engine + g_resolved.engineOffGlobalHandle);
 
         LOG("[CCM]   CSteamEngine: %p (global at sc+0x%X)", (void*)engine, SC_RVA_GLOBAL_ENGINE);
         LOG("[CCM]   Global user handle: %u", handle);
@@ -1610,8 +1631,9 @@ const std::string& GetSteamPath() {
 }
 
 // Service-method vtable hook (Approach E): intercept Cloud RPCs via slot 4/5.
-// CProtoBufMsg layout: +40 header*, +48 body*
-// CMsgProtoBufHeader: +16 has_bits, +24 appid, +116 routing_appid, +216 eresult, +220 error_code
+// CProtoBufMsg header/body offsets are verified from the live transport adapters.
+// CMsgProtoBufHeader: +16 has_bits, +24 appid, +116 routing_appid,
+// +216 eresult, +220 transport_error (k_EResultOK = 1).
 
 // Serialize a protobuf message body object to raw bytes
 // SEH helpers (cannot use __try in functions with C++ objects)
@@ -1719,7 +1741,7 @@ static bool SEH_WriteResponseHeader(void* respHeader, int32_t eresult = 1) {
         *(int32_t*)((uintptr_t)respHeader + 216) = eresult;
 
         *(uint32_t*)((uintptr_t)respHeader + 16) |= 0x40000000u;
-        *(int32_t*)((uintptr_t)respHeader + 220) = 0;
+        *(int32_t*)((uintptr_t)respHeader + 220) = 1;
         return true;
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         LOG("[VtHook] EXCEPTION writing response header: code=0x%08X", GetExceptionCode());
@@ -1748,7 +1770,8 @@ static std::optional<RpcResult> DispatchCloudRpc(
 // Vtable slot 4 hook: direct request/response (no CProtoBufMsg wrapper).
 // ClientBeginFileUpload / ClientCommitFileUpload / ClientFileDownload all
 // call slot 4 directly, so handling here avoids the slot-5 deferred queue.
-// Flags layout (int[68]): [0]=routing_appid, [1]=mode, [2]=error_code, [3]=eresult, [4..67]=error_message
+// Flags layout (int[68]): [0]=routing_appid, [1]=mode, [2]=transport_error,
+// [3]=eresult, [4..67]=error_message. Successful transport is 1, even for an RPC error.
 static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* methodName,
                                                   void* requestBody, void* responseBody, int* flags) {
     HookGuard guard;
@@ -1805,7 +1828,7 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
                     if (flags) { flags[2] = 1; flags[3] = res.eresult; }
                     LOG("[Stats] GetUserStats app=%u handled locally via slot4 (%zu bytes)",
                         appId, res.body.Size());
-                    return true;
+                    return res.eresult == 1;
                 }
                 LOG("[Stats] GetUserStats app=%u slot4 NOT handled (bodySize=%zu) -> passthrough",
                     appId, res.body.Size());
@@ -1903,7 +1926,7 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
         methodName, (long long)slot4Ms,
         flags ? flags[0] : -1, flags ? flags[1] : -1,
         flags ? flags[2] : -1, flags ? flags[3] : -1);
-    return true;
+    return result.eresult == 1;
 }
 
 // ── Native Cloud spy ──────────────────────────────────────────────────────
@@ -1969,7 +1992,7 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
         strcmp(methodName, "Parental.GetSignedParentalSettings#1") == 0) {
         bool result = g_originalSlot5(thisptr, methodName, request, response, flags);
         if (result && response) {
-            void* respBody = *(void**)((uintptr_t)response + 48);
+            void* respBody = MessageBody(response);
             if (respBody) {
                 auto respBytes = SerializeBodyToBytes(respBody);
                 auto respFields = PB::Parse(respBytes.data(), respBytes.size());
@@ -1999,7 +2022,7 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
             ? MetadataSync::answerUserStats.load(std::memory_order_relaxed)
             : MetadataSync::SchemaFetchEnabled())) {
         if (request && response) {
-            void* reqBody = *(void**)((uintptr_t)request + 48);
+            void* reqBody = MessageBody(request);
             if (reqBody) {
                 auto reqBytes = SerializeBodyToBytes(reqBody);
                 auto reqFields = PB::Parse(reqBytes.data(), reqBytes.size());
@@ -2009,16 +2032,23 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
                 LOG("[Stats] slot5 GetUserStats seen: app=%u namespace=%d", appId, IsNamespaceApp(appId) ? 1 : 0);
                 if (appId != 0 && IsNamespaceApp(appId)) {
                     auto res = StatsHandlers::HandleGetUserStats(appId, reqFields);
-                    void* respBody = *(void**)((uintptr_t)response + 48);
-                    if (respBody && res.body.Size() > 0 &&
+                    void* respBody = MessageBody(response);
+                    void* respHeader = MessageHeader(response);
+                    if (respHeader && respBody && res.body.Size() > 0 &&
                         ParseBytesToBody(respBody, res.body.Data().data(), res.body.Size())) {
-                        if (flags) *flags = 0;
+                        if (!SEH_WriteResponseHeader(respHeader, res.eresult)) return false;
+                        if (flags) {
+                            auto* f32 = reinterpret_cast<int32_t*>(flags);
+                            f32[2] = 1;
+                            f32[3] = res.eresult;
+                            reinterpret_cast<char*>(f32 + 4)[0] = '\0';
+                        }
                         LOG("[Stats] GetUserStats app=%u handled locally (%zu bytes)",
                             appId, res.body.Size());
-                        return true;
+                        return res.eresult == 1;
                     }
                     LOG("[Stats] GetUserStats app=%u NOT handled (respBody=%p bodySize=%zu) -> passthrough",
-                        appId, *(void**)((uintptr_t)response + 48), res.body.Size());
+                        appId, MessageBody(response), res.body.Size());
                 }
             } else {
                 LOG("[Stats] slot5 GetUserStats: null reqBody -> passthrough");
@@ -2035,12 +2065,12 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
         bool result = g_originalSlot5(thisptr, methodName, request, response, flags);
         LOG("[Stats] slot5 GetLastPlayedTimes seen: serverResult=%d", result ? 1 : 0);
         if (result && response) {
-            void* respBody = *(void**)((uintptr_t)response + 48);
+            void* respBody = MessageBody(response);
             if (respBody) {
                 // Parse the request to honor min_last_played.
                 std::vector<PB::Field> reqFields;
                 if (request) {
-                    void* reqBody = *(void**)((uintptr_t)request + 48);
+                    void* reqBody = MessageBody(request);
                     if (reqBody) {
                         auto reqBytes = SerializeBodyToBytes(reqBody);
                         reqFields = PB::Parse(reqBytes.data(), reqBytes.size());
@@ -2107,8 +2137,8 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
 
-    // Extract the request body from CProtoBufMsg+48
-    void* reqBody = *(void**)((uintptr_t)request + 48);
+    // Extract the body using the verified wrapper layout.
+    void* reqBody = MessageBody(request);
     if (!reqBody) {
         LOG("[VtHook] %s: request body is NULL, passing through", methodName);
         return g_originalSlot5(thisptr, methodName, request, response, flags);
@@ -2151,7 +2181,7 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
             bool spyResult = g_originalSlot5(thisptr, methodName, request, response, flags);
             // Inspect the response body only on success: a failed call may leave the
             // body slot without a constructed message.
-            void* spyRespBody = spyResult ? *(void**)((uintptr_t)response + 48) : nullptr;
+            void* spyRespBody = spyResult ? MessageBody(response) : nullptr;
             if (spyRespBody) {
                 auto respBytes = SerializeBodyToBytes(spyRespBody);
                 LOG("[SPY] %s app=%u native response (%zu bytes, result=%d):",
@@ -2178,7 +2208,7 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
 
     // Capture SteamID from the request header. Detects account switches.
     if (!g_steamIdFromHeader.load()) {
-        void* reqHeader = *(void**)((uintptr_t)request + 40);
+        void* reqHeader = MessageHeader(request);
         if (reqHeader) {
             auto hdrBytes = SerializeBodyToBytes(reqHeader);
             if (!hdrBytes.empty()) {
@@ -2244,14 +2274,14 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
 
     // Validate response header BEFORE writing body to avoid corrupting the
     // response protobuf object on a failure path.
-    void* respHeader = *(void**)((uintptr_t)response + 40);
+    void* respHeader = MessageHeader(response);
     if (!respHeader) {
         LOG("[VtHook] %s: respHeader is NULL, cannot deliver response", methodName);
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
 
     // Write the response body into the response CProtoBufMsg
-    void* respBody = *(void**)((uintptr_t)response + 48);
+    void* respBody = MessageBody(response);
     if (!respBody) {
         LOG("[VtHook] %s: response body object is NULL, cannot write response!", methodName);
         return g_originalSlot5(thisptr, methodName, request, response, flags);
@@ -2264,34 +2294,34 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
         }
     }
 
-    // Write eresult into response header (CProtoBufMsg+40):
-    //   has_bits |= 0x20000000 (eresult), |= 0x40000000 (error_message)
-    //   header+216 = eresult, header+220 = error_code
+    // Write eresult into the resolved response header:
+    //   has_bits |= 0x20000000 (eresult), |= 0x40000000 (transport_error)
+    //   header+216 = eresult, header+220 = transport success (1)
     if (!SEH_WriteResponseHeader(respHeader, result.eresult)) {
-        return g_originalSlot5(thisptr, methodName, request, response, flags);
+        return false; // Body already changed; do not fall through and dispatch twice.
     }
-    LOG("[VtHook] Set response header: eresult=%d, error=0", result.eresult);
+    LOG("[VtHook] Set response header: eresult=%d, transport=1", result.eresult);
 
     // Populate flags output (caller reads in addition to the header).
     if (flags) {
         // flags layout (from slot 5):
         //   flags[0] = int32_t routing_appid
-        //   flags[1] = int32_t (always 1, set in slot 5 constructor)
-        //   flags[2] = int32_t error_code -> written to respHeader+220
+        //   flags[1] = int32_t input mode (preserved)
+        //   flags[2] = int32_t transport_error -> written to respHeader+220
         //   flags[3] = int32_t eresult -> written to respHeader+216
         //   flags[4..] = char[256] target_job_name
         int32_t* f32 = reinterpret_cast<int32_t*>(flags);
-        f32[0] = 0;  // routing_appid (not relevant for our response)
-        // f32[1] already set by caller (= 1)
-        f32[2] = 0;  // error_code
+        // Preserve caller's routing_appid and mode.
+        f32[2] = 1;  // transport success (same contract as slot 4)
         f32[3] = result.eresult;
+        reinterpret_cast<char*>(f32 + 4)[0] = '\0';
     }
 
     auto slot5Ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - slot5Start).count();
     LOG("[VtHook] SUCCESS: %s app=%u handled in %lldms (response %zu bytes)",
         methodName, realAppId, (long long)slot5Ms, result.body.Size());
-    return true;
+    return result.eresult == 1;
 }
 
 // Notification hook helpers
@@ -2325,7 +2355,7 @@ static uint32_t CheckNotificationNamespaceApp(const char* methodName, void* body
 }
 
 // Slot 8 hook - Notification wrapper (e.g. SignalAppExitSyncDone)
-// request is a CProtoBufMsg* with body at +48, header at +40
+// request is a CProtoBufMsg*; use its verified header/body offsets.
 static bool __fastcall NotificationWrapperHook(void* thisptr, const char* methodName, void* request) {
     HookGuard guard;
     if (g_shuttingDown.load(std::memory_order_acquire))
@@ -2336,7 +2366,7 @@ static bool __fastcall NotificationWrapperHook(void* thisptr, const char* method
 
     if (ParentalBypass::IsParentalNotification(methodName) && g_parentalBypassPlaytime.load()) {
         if (request) {
-            void* bodyObj = *(void**)((uintptr_t)request + 48);
+            void* bodyObj = MessageBody(request);
             if (bodyObj && strcmp(methodName, ParentalBypass::NOTIFY_SETTINGS_CHANGE) == 0) {
                 auto bodyBytes = SerializeBodyToBytes(bodyObj);
                 auto notifFields = PB::Parse(bodyBytes.data(), bodyBytes.size());
@@ -2374,8 +2404,8 @@ static bool __fastcall NotificationWrapperHook(void* thisptr, const char* method
         return g_originalSlot8(thisptr, methodName, request);
     }
 
-    // Extract body from CProtoBufMsg+48
-    void* bodyObj = *(void**)((uintptr_t)request + 48);
+    // Extract the body using the verified wrapper layout.
+    void* bodyObj = MessageBody(request);
     uint32_t realAppId = CheckNotificationNamespaceApp(methodName, bodyObj);
 
     if (realAppId == 0) {
@@ -2873,6 +2903,14 @@ static void InstallServiceMethodHookLocked() {
     g_originalSlot8 = currentSlot8;
     LOG("[VtHook] Original slot 8: %p (RVA=0x%llX)",
         (void*)currentSlot8, (uint64_t)((uintptr_t)currentSlot8 - g_steamClientBase));
+
+    if (!ResolveMessageLayout(reinterpret_cast<uintptr_t>(currentSlot5),
+                              reinterpret_cast<uintptr_t>(currentSlot8))) {
+        RefuseVtableHook("message wrapper layout could not be verified in slots 5 and 8");
+        return;
+    }
+    LOG("[VtHook] Verified message wrapper: header=0x%X body=0x%X",
+        g_messageLayout.header, g_messageLayout.body);
 
     // Patch all four slots in one writable window.
     uintptr_t regionStart = vtableSlot4Addr;

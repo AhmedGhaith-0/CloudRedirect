@@ -54,13 +54,13 @@ struct ResolvedAddrs {
     uintptr_t respWrapperVtable;          // CProtoBufMsg<...Response> vtable
     uintptr_t regKeySyncTime;             // pointer to "LastPlayedTimesSyncTime" registry key string
 
-    // ── Struct offsets (0 = not resolved) ──────────────────────────────
+    // ── Struct offsets (0 = not resolved; never use stale fallbacks) ────
     uint32_t engineOffJobMgr;             // CSteamEngine -> CJobMgr
     uint32_t engineOffGlobalHandle;       // CSteamEngine -> uint32 global user handle
     uint32_t engineOffUserMap;            // CSteamEngine -> CUtlSortedVector user map
     uint32_t ccmOffConnContext;           // CCMInterface -> connection context ptr
     uint32_t userOffCcmInterface;         // CBaseUser -> CCMInterface
-    uint32_t engineOffAppInfoCache;       // CSteamEngine -> CAppInfoCache
+    uint32_t engineOffAppInfoCache;       // resolved atomically with globalEngine
 
     // ── KV Injector ────────────────────────────────────────────────────
     uintptr_t getAppInfo;                 // CAppInfoCache::GetAppInfo
@@ -76,7 +76,6 @@ struct ResolvedAddrs {
 
 // Run all resolvers against the loaded steamclient64.dll.
 // steamClientBase: base address of steamclient64.dll in memory.
-// hardcoded: fallback RVAs (current build). Used for validation and as fallback.
 // Returns resolved addresses. Check individual fields for 0 (failure).
 ResolvedAddrs Resolve(uintptr_t steamClientBase);
 

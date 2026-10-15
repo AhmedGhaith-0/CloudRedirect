@@ -99,12 +99,24 @@ jobs:
       - name: Build and run fork unit tests
         shell: pwsh
         run: |
-          cmake --build build --config Release --target stats_store_fork_tests autocloud_injection_tests
+          cmake --build build --config Release --target stats_store_fork_tests autocloud_injection_tests steam_message_layout_tests steam_resolver_tests
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/Release/stats_store_fork_tests.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/Release/autocloud_injection_tests.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/Release/steam_message_layout_tests.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/Release/steam_resolver_tests.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Upload offline Steam compatibility tests
+        uses: actions/upload-artifact@v5
+        with:
+          name: Steam-compatibility-tests-${{ github.sha }}
+          path: |
+            build/Release/steam_message_layout_tests.exe
+            build/Release/steam_resolver_tests.exe
 
       - name: Build native x86 (cloud760_tool.exe)
         shell: pwsh
