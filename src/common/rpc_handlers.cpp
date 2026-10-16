@@ -12,6 +12,7 @@
 #include "cloud_staging.h"
 #include "app_state.h"
 #include "cloud_storage.h"
+#include "forensic_util.h"
 #include "coop_yield.h"
 #include "pending_ops_journal.h"
 #include "file_util.h"
@@ -55,7 +56,8 @@ void RecordConflictResolution(uint32_t appId, bool choseLocal) {
         LOG("[NS] ConflictResolution app=%u: user chose keep-local, will skip pre-restore", appId);
     } else {
         g_conflictKeepLocal.erase(appId);
-        LOG("[NS] ConflictResolution app=%u: user chose keep-cloud", appId);
+        LOG("[NS-FOR] ConflictResolution app=%u: user chose keep-REMOTE "
+            "(cloud will overwrite local copies)", appId);
     }
 }
 
@@ -117,6 +119,31 @@ static uint32_t ClampFileSizeToUint32(uint64_t rawSize, const char* fieldName,
         return 0xFFFFFFFFu;
     }
     return static_cast<uint32_t>(rawSize);
+}
+
+// Build the forensic rule list from native AutoCloud rules: same raw-root token
+// and path normalization the serving path uses, plus resolvedPath for mapping
+// cloud filenames back onto the local disk.
+static std::vector<ForensicUtil::ForensicRule> BuildForensicRules(
+        const std::vector<AutoCloudUtil::AutoCloudRuleNative>& rules) {
+    std::vector<ForensicUtil::ForensicRule> out;
+    out.reserve(rules.size());
+    for (const auto& r : rules) {
+        const std::string& rawRoot = !r.cloudRoot.empty() ? r.cloudRoot : r.root;
+        if (rawRoot.empty()) continue;
+        ForensicUtil::ForensicRule fr;
+        fr.token = "%" + rawRoot + "%";
+        std::string p = r.path;
+        for (auto& c : p) if (c == '\\') c = '/';
+        while (!p.empty() && p.front() == '/') p.erase(0, 1);
+        while (!p.empty() && p.back() == '/') p.pop_back();
+        fr.cloudPath = p;
+        fr.resolvedPath = r.resolvedPath;
+        fr.pattern = r.pattern.empty() ? "*" : r.pattern;
+        fr.recursive = r.recursive;
+        out.push_back(std::move(fr));
+    }
+    return out;
 }
 
 
@@ -709,6 +736,8 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
     std::vector<LocalStorage::FileEntry> files;
     uint64_t serverChangeNumber = 0;  // Initialize to prevent UB in edge cases
     bool responseIsDelta = true;
+    // [NS-FOR] which branch served this changelist; surfaced in the SUMMARY line.
+    const char* serveBranch = "unset";
 
     const uint64_t guardLocalCN = LocalStorage::GetChangeNumber(accountId, appId);
     const bool interruptedUpload =
@@ -718,6 +747,7 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
         // Cloud state unknown: serve local files as a pure delta (is_only_delta=1)
         // so Steam never reconcile-deletes or treats it as cloud-empty. Don't rewind CN.
         SetRpcCrashContext("GetChangelist:inconclusive-fetch", "Cloud.GetAppFileChangelist#1", appId);
+        serveBranch = "inconclusive-fetch";
         files = LocalStorage::GetFileList(accountId, appId);
         serverChangeNumber = clientChangeNumber > cloudCN ? clientChangeNumber : cloudCN;
         responseIsDelta = true;
@@ -730,11 +760,13 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
             appId, files.size(), serverChangeNumber, clientChangeNumber);
     } else if (haveCloudManifest && cloudManifest.empty() && cloudCN == 0) {
         // New app at CN=0 -- return empty authoritative inventory
+        serveBranch = "cloud-empty-new";
         serverChangeNumber = cloudCN;
         responseIsDelta = false;
         LOG("[NS-CL] GetAppFileChangelist app=%u: cloud manifest is empty at CN=%llu, returning empty authoritative inventory",
             appId, cloudCN);
     } else if (haveCloudManifest && cloudManifest.empty() && cloudCN > 0) {
+        serveBranch = "cloud-empty-nonzero";
         serverChangeNumber = cloudCN;
         responseIsDelta = false;
         LOG("[NS-CL] GetAppFileChangelist app=%u: cloud manifest is empty at CN=%llu, "
@@ -743,6 +775,7 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
     } else if (haveCloudManifest && !cloudManifest.empty() && interruptedUpload &&
                cloudCN <= guardLocalCN && clientChangeNumber >= cloudCN) {
         SetRpcCrashContext("GetChangelist:interrupted-upload", "Cloud.GetAppFileChangelist#1", appId);
+        serveBranch = "interrupted-upload";
         serverChangeNumber = clientChangeNumber > cloudCN ? clientChangeNumber : cloudCN;
         responseIsDelta = true;
         LOG("[NS-CL] GetAppFileChangelist app=%u: interrupted upload (cloudCN=%llu <= "
@@ -757,6 +790,7 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
                                                          clientChangeNumber, cloudCN,
                                                          cloudManifest);
         if (!delta.files.empty()) {
+            serveBranch = "delta";
             serverChangeNumber = delta.serverCN;
             responseIsDelta = true;
             for (auto& fc : delta.files) {
@@ -788,18 +822,21 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
                 // Client ahead of cloud (failed batch). IDA-verified: Steam iterates
                 // ALL response files through sub_138532B20 regardless of CN match.
                 // Zero files = zero damage.
+                serveBranch = "failed-batch-empty";
                 responseIsDelta = true;
                 LOG("[NS-CL] GetAppFileChangelist app=%u: clientCN=%llu > cloudCN=%llu "
                     "(failed batch), returning empty delta to protect local saves",
                     appId, clientChangeNumber, cloudCN);
             } else if (alreadySentFull) {
                 // Subsequent call: empty delta (avoids stale SHA/timestamp conflicts).
+                serveBranch = "already-full-empty";
                 responseIsDelta = true;
                 LOG("[NS-CL] GetAppFileChangelist app=%u: already sent full manifest this session, returning empty delta at CN=%llu",
                     appId, cloudCN);
             } else {
                 // First call: full manifest. Use cloud timestamps so subsequent
                 // compares see the same remotetime (avoids false conflicts).
+                serveBranch = "full-manifest";
                 responseIsDelta = false;
 
                 for (const auto& [filename, entry] : cloudManifest) {
@@ -826,7 +863,7 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
     } else {
         // No cloud manifest -- serve local files as delta (don't trigger reconcile-deletes)
         SetRpcCrashContext("GetChangelist:local-files", "Cloud.GetAppFileChangelist#1", appId);
-        
+        serveBranch = "local-files";
         files = LocalStorage::GetFileList(accountId, appId);
         serverChangeNumber = LocalStorage::GetChangeNumber(accountId, appId);
         // cloud active but fetch failed -> delta (don't delete unverified); cloud inactive -> authoritative
@@ -998,9 +1035,12 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
     }
 
     std::vector<RuleRoot> ruleRoots;
+    // [NS-FOR] same rules, kept with resolvedPath for local-disk forensics.
+    std::vector<ForensicUtil::ForensicRule> forensicRules;
     {
         if (!steamPath.empty()) {
             auto rules = AutoCloudScan::GetRules(steamPath, appId, accountId);
+            forensicRules = BuildForensicRules(rules);
             for (const auto& r : rules) {
                 // Use RAW rule root (cloudRoot), not override-resolved root. Native
                 // keys cloud storage by raw root; collapsing loses cross-root dupes.
@@ -1055,7 +1095,62 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
     };
 
     SetRpcCrashContext("GetChangelist:prepare-files", "Cloud.GetAppFileChangelist#1", appId);
+
+    // [NS-FOR] per-file overwrite forensics: what we serve vs what's on disk in
+    // the game folder. Budget bounds total hashing per call; per-file lines are
+    // capped so a full manifest can't flood the log (summary always logs).
+    uint64_t forShaBudget = ForensicUtil::kShaBudgetBytes;
+    size_t forServed = 0, forMatch = 0, forLocalNewer = 0, forCloudNewer = 0,
+           forMissing = 0, forShaSkipped = 0, forNoServedSha = 0, forDeleted = 0,
+           forUnresolved = 0, forLogged = 0;
+    static constexpr size_t kMaxForensicFileLines = 50;
+
     for (auto& fe : files) {
+        // [NS-FOR] forensics cover live entries only; deleted files still get
+        // their wire entry (persist_state=2) so Steam propagates the delete.
+        if (fe.deleted) {
+            ++forDeleted;
+        } else {
+            ++forServed;
+            std::string forLocalPath = ForensicUtil::ResolveLocalPathForCloudFile(
+                forensicRules, resolvableTokens, accountId, fe.filename);
+            ForensicUtil::LocalFileInfo forLocal;
+            if (!forLocalPath.empty())
+                forLocal = ForensicUtil::InspectLocalFile(forLocalPath, forShaBudget);
+            else
+                ++forUnresolved;
+            auto forVerdict = ForensicUtil::ClassifyServeVerdict(
+                forLocal, fe.sha, fe.timestamp);
+            switch (forVerdict) {
+                case ForensicUtil::ServeVerdict::Match:        ++forMatch; break;
+                case ForensicUtil::ServeVerdict::LocalNewer:   ++forLocalNewer; break;
+                case ForensicUtil::ServeVerdict::CloudNewer:   ++forCloudNewer; break;
+                case ForensicUtil::ServeVerdict::LocalMissing: ++forMissing; break;
+                case ForensicUtil::ServeVerdict::ShaSkipped:   ++forShaSkipped; break;
+                case ForensicUtil::ServeVerdict::NoServedSha:  ++forNoServedSha; break;
+            }
+            // Per-file lines only for the verdicts that indicate a decision worth
+            // inspecting later; MATCH/LOCAL_MISSING stay summary-only.
+            if (forVerdict != ForensicUtil::ServeVerdict::Match &&
+                forVerdict != ForensicUtil::ServeVerdict::LocalMissing &&
+                forLogged < kMaxForensicFileLines) {
+                ++forLogged;
+                LOG("[NS-FOR] app=%u file=%s served_sha=%s ts=%llu size=%llu "
+                    "local=%s exists=%d local_sha=%s local_mtime=%llu local_size=%llu "
+                    "verdict=%s",
+                    appId, fe.filename.c_str(),
+                    ForensicUtil::ShaHex(fe.sha).c_str(),
+                    (unsigned long long)fe.timestamp,
+                    (unsigned long long)fe.rawSize,
+                    forLocalPath.empty() ? "(unresolved)" : forLocalPath.c_str(),
+                    forLocal.exists ? 1 : 0,
+                    ForensicUtil::ShaHex(forLocal.sha).c_str(),
+                    (unsigned long long)forLocal.mtime,
+                    (unsigned long long)forLocal.size,
+                    ForensicUtil::ServeVerdictName(forVerdict));
+            }
+        }
+
         // split filename into directory prefix + leaf
         size_t lastSlash = fe.filename.rfind('/');
         std::string dirPrefix, leaf;
@@ -1125,6 +1220,16 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
         remotecacheCandidates.push_back(
             { fe.filename, primaryToken, fe.sha, fe.timestamp, fe.rawSize });
     }
+
+    LOG("[NS-FOR] SUMMARY app=%u branch=%s clientCN=%llu cloudCN=%llu localCN=%llu "
+        "served=%zu match=%zu localNewer=%zu cloudNewer=%zu missing=%zu "
+        "shaSkipped=%zu noServedSha=%zu deleted=%zu unresolvedPath=%zu",
+        appId, serveBranch,
+        (unsigned long long)clientChangeNumber,
+        (unsigned long long)cloudCN,
+        (unsigned long long)guardLocalCN,
+        forServed, forMatch, forLocalNewer, forCloudNewer, forMissing,
+        forShaSkipped, forNoServedSha, forDeleted, forUnresolved);
 
     // Don't pre-seed remotecache.vdf; let Steam manage it via GetChangelist diffs.
     // Pre-seeding caused conflicts (Steam interpreted it as "local changed").
@@ -2264,6 +2369,40 @@ RpcResult HandleFileDownload(uint32_t appId, const std::vector<PB::Field>& reqBo
 
     LOG("[NS-DL] FileDownload app=%u file=%s (clean=%s) size=%llu -> %s%s",
         appId, filename.c_str(), cleanName.c_str(), fileSize, urlHost.c_str(), urlPath.c_str());
+
+    // [NS-FOR-DL] last checkpoint before Steam downloads and overwrites the
+    // on-disk copy. Compare the blob we're about to serve vs the local file.
+    {
+        std::string forSteamPath = CloudIntercept::GetSteamPath();
+        if (!forSteamPath.empty()) {
+            uint64_t forShaBudget = ForensicUtil::kShaBudgetBytes;
+            auto forTokenDirs = AutoCloudScan::GetRootTokenDirectories(
+                forSteamPath, appId, accountId);
+            auto forRules = BuildForensicRules(
+                AutoCloudScan::GetRules(forSteamPath, appId, accountId));
+            std::string forLocalPath = ForensicUtil::ResolveLocalPathForCloudFile(
+                forRules, forTokenDirs, accountId, cleanName);
+            ForensicUtil::LocalFileInfo forLocal;
+            if (!forLocalPath.empty())
+                forLocal = ForensicUtil::InspectLocalFile(forLocalPath, forShaBudget);
+            auto forVerdict = ForensicUtil::ClassifyServeVerdict(forLocal, sha, timestamp);
+            LOG("[NS-FOR-DL] app=%u file=%s served_sha=%s ts=%llu size=%llu "
+                "local=%s exists=%d local_sha=%s local_mtime=%llu local_size=%llu "
+                "verdict=%s%s",
+                appId, cleanName.c_str(),
+                ForensicUtil::ShaHex(sha).c_str(),
+                (unsigned long long)timestamp,
+                (unsigned long long)fileSize,
+                forLocalPath.empty() ? "(unresolved)" : forLocalPath.c_str(),
+                forLocal.exists ? 1 : 0,
+                ForensicUtil::ShaHex(forLocal.sha).c_str(),
+                (unsigned long long)forLocal.mtime,
+                (unsigned long long)forLocal.size,
+                ForensicUtil::ServeVerdictName(forVerdict),
+                forVerdict == ForensicUtil::ServeVerdict::LocalNewer
+                    ? " ** WOULD OVERWRITE NEWER LOCAL **" : "");
+        }
+    }
 
     uint32_t clampedSize = ClampFileSizeToUint32(fileSize,
                                                  "FileDownload_Response.file_size",

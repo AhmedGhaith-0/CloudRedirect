@@ -1,10 +1,12 @@
 // Exercise the full rule round trip: appinfo -> CR's local resolution -> KV
 // injection -> Steam's root overrides. No game files or Steam process needed.
 #include "autocloud_injection.h"
+#include "forensic_util.h"
 
 #include <cstdio>
 #include <map>
 #include <memory>
+#include <unordered_map>
 
 namespace Log { void Write(const char*, ...) {} }
 
@@ -209,12 +211,161 @@ static void FiltersKeepTheirOriginalRepresentation() {
                                              failFind, setString, setInt));
 }
 
+static void ForensicPathResolution() {
+    using ForensicUtil::ForensicRule;
+    using ForensicUtil::ResolveLocalPathForCloudFile;
+
+    // Token -> directory map as GetRootTokenDirectories returns it (with a
+    // trailing separator).
+    std::unordered_map<std::string, std::string> tokenDirs = {
+        {"%WinAppDataLocalLow%", "C:/Users/u/AppData/LocalLow/"},
+        {"%GameInstall%", "C:/Games/SomeGame/"},
+    };
+
+    // Basic match: recursive rule, cloud path prefix + leaf.
+    {
+        ForensicRule r;
+        r.token = "%WinAppDataLocalLow%";
+        r.cloudPath = "Publisher/Game";
+        r.resolvedPath = "Publisher/Game";
+        r.pattern = "*.sav";
+        r.recursive = true;
+        auto path = ResolveLocalPathForCloudFile({r}, tokenDirs, 1234,
+                                                 "Publisher/Game/save1.sav");
+        CHECK(path == "C:/Users/u/AppData/LocalLow/Publisher/Game/save1.sav");
+    }
+    // Case-insensitive prefix match; {Steam3AccountID} expands in resolvedPath.
+    {
+        ForensicRule r;
+        r.token = "%WinAppDataLocalLow%";
+        r.cloudPath = "Publisher/Game";
+        r.resolvedPath = "Publisher/{Steam3AccountID}";
+        r.pattern = "*.sav";
+        r.recursive = true;
+        auto path = ResolveLocalPathForCloudFile({r}, tokenDirs, 1234,
+                                                 "publisher/game/save1.sav");
+        CHECK(path == "C:/Users/u/AppData/LocalLow/Publisher/1234/save1.sav");
+    }
+    // Non-recursive rule rejects nested files.
+    {
+        ForensicRule r;
+        r.token = "%GameInstall%";
+        r.cloudPath = "saves";
+        r.resolvedPath = "saves";
+        r.pattern = "*.dat";
+        r.recursive = false;
+        CHECK(ResolveLocalPathForCloudFile({r}, tokenDirs, 1234,
+                                           "saves/sub/a.dat").empty());
+        CHECK(!ResolveLocalPathForCloudFile({r}, tokenDirs, 1234,
+                                            "saves/a.dat").empty());
+    }
+    // Pattern mismatch is not resolved.
+    {
+        ForensicRule r;
+        r.token = "%GameInstall%";
+        r.cloudPath = "saves";
+        r.resolvedPath = "saves";
+        r.pattern = "*.sav";
+        r.recursive = true;
+        CHECK(ResolveLocalPathForCloudFile({r}, tokenDirs, 1234,
+                                           "saves/notes.txt").empty());
+    }
+    // Unresolvable token: no local path.
+    {
+        ForensicRule r;
+        r.token = "%MacAppSupport%";
+        r.cloudPath = "Saves";
+        r.resolvedPath = "Saves";
+        r.pattern = "*";
+        r.recursive = true;
+        CHECK(ResolveLocalPathForCloudFile({r}, tokenDirs, 1234,
+                                           "Saves/a.sav").empty());
+    }
+    // Empty cloudPath: file lives directly under the token root.
+    {
+        ForensicRule r;
+        r.token = "%GameInstall%";
+        r.cloudPath = "";
+        r.resolvedPath = "";
+        r.pattern = "*.sav";
+        r.recursive = true;
+        auto path = ResolveLocalPathForCloudFile({r}, tokenDirs, 1234, "a.sav");
+        CHECK(path == "C:/Games/SomeGame/a.sav");
+    }
+}
+
+static void ForensicVerdicts() {
+    using ForensicUtil::ClassifyServeVerdict;
+    using ForensicUtil::LocalFileInfo;
+    using ForensicUtil::ServeVerdict;
+    using ForensicUtil::ServeVerdictName;
+
+    const std::vector<uint8_t> shaA = {1, 2, 3, 4};
+    const std::vector<uint8_t> shaB = {9, 9, 9, 9};
+
+    // No local file.
+    {
+        LocalFileInfo local; // exists = false
+        CHECK(ClassifyServeVerdict(local, shaA, 1000) == ServeVerdict::LocalMissing);
+    }
+    // Cloud entry carries no sha.
+    {
+        LocalFileInfo local;
+        local.exists = true;
+        CHECK(ClassifyServeVerdict(local, {}, 1000) == ServeVerdict::NoServedSha);
+    }
+    // Identical content.
+    {
+        LocalFileInfo local;
+        local.exists = true;
+        local.sha = shaA;
+        local.mtime = 500;
+        CHECK(ClassifyServeVerdict(local, shaA, 1000) == ServeVerdict::Match);
+    }
+    // Content differs; local mtime newer than served ts -> dangerous.
+    {
+        LocalFileInfo local;
+        local.exists = true;
+        local.sha = shaA;
+        local.mtime = 2000;
+        CHECK(ClassifyServeVerdict(local, shaB, 1000) == ServeVerdict::LocalNewer);
+    }
+    // Content differs; served ts >= local mtime -> normal download.
+    {
+        LocalFileInfo local;
+        local.exists = true;
+        local.sha = shaA;
+        local.mtime = 500;
+        CHECK(ClassifyServeVerdict(local, shaB, 1000) == ServeVerdict::CloudNewer);
+    }
+    // No sha computed (over cap): timestamps only.
+    {
+        LocalFileInfo local;
+        local.exists = true;
+        local.mtime = 2000;
+        CHECK(ClassifyServeVerdict(local, shaA, 1000) == ServeVerdict::LocalNewer);
+        local.mtime = 500;
+        CHECK(ClassifyServeVerdict(local, shaA, 1000) == ServeVerdict::ShaSkipped);
+        local.mtime = 0;
+        CHECK(ClassifyServeVerdict(local, shaA, 1000) == ServeVerdict::ShaSkipped);
+    }
+    // Hex encoding is full-width (40 chars for a real SHA-1).
+    CHECK(ForensicUtil::ShaHex(shaA).size() == 8); // test vector is 4 bytes
+    CHECK(ForensicUtil::ShaHex({0xde, 0xad, 0xbe, 0xef}) == "deadbeef");
+    CHECK(ForensicUtil::ShaHex({}).empty());
+    // Verdict names are stable (greppable in logs).
+    CHECK(std::string(ServeVerdictName(ServeVerdict::LocalNewer)) == "LOCAL-NEWER");
+    CHECK(std::string(ServeVerdictName(ServeVerdict::Match)) == "match");
+}
+
 int main() {
     SummerClover();
     PlainRulesStayUnchanged();
     OverrideVariants();
     NativeLinuxAndNonmatchingOverrides();
     FiltersKeepTheirOriginalRepresentation();
+    ForensicPathResolution();
+    ForensicVerdicts();
     // Callers without an explicit cloud root retain their existing root.
     auto legacy = Rule("WinSavedGames", "Example");
     legacy.cloudRoot.clear();
