@@ -565,6 +565,77 @@ static std::string GetMachineName() {
 #endif
 }
 
+// [NS-HEAL] Cloud CN fell behind local (failed/interrupted publish): re-publish
+// the local manifest overlay so Steam's next sync sees the saves we already
+// promoted locally. Blobs are already durable on the provider (promote uploads
+// them via CAS before the state publish), so this only needs to land the state
+// JSON. Runs at most once per app per session on a background thread; a failed
+// heal retries on the next launch via this same changelist branch.
+static void MaybeHealCloudDivergence(uint32_t accountId, uint32_t appId,
+                                     uint64_t localCN, uint64_t cloudCN) {
+    static std::mutex healOnceMutex;
+    static std::unordered_set<uint64_t> healedApps;
+    const uint64_t appKey = MakeAppAccountKey(accountId, appId);
+    {
+        std::lock_guard<std::mutex> lock(healOnceMutex);
+        if (!healedApps.insert(appKey).second) return;
+    }
+    LOG("[NS-HEAL] app=%u: cloud CN=%llu behind local CN=%llu -- re-publishing "
+        "local manifest overlay to heal divergence", appId,
+        (unsigned long long)cloudCN, (unsigned long long)localCN);
+    std::thread([accountId, appId, appKey, localCN, cloudCN]() {
+        CloudStorage::InflightSyncScope guard;
+        if (!guard.entered) return;
+        auto syncMtx = CloudStorage::AcquireAppSyncMutex(accountId, appId);
+        std::lock_guard<std::mutex> lock(*syncMtx);
+        auto result = CloudStorage::FetchCloudState(accountId, appId);
+        if (result.status != CloudStorage::StateFetchStatus::Ok &&
+            result.status != CloudStorage::StateFetchStatus::NotFound) {
+            LOG("[NS-HEAL] app=%u: cloud fetch failed (status=%d); heal deferred, "
+                "will retry next launch", appId, static_cast<int>(result.status));
+            return;
+        }
+        CloudStorage::CloudAppState state = std::move(result.state);
+        if (result.status == CloudStorage::StateFetchStatus::NotFound)
+            state = CloudStorage::CloudAppState{};
+        if (state.cn >= localCN) {
+            LOG("[NS-HEAL] app=%u: cloud CN already %llu >= local CN=%llu; nothing to heal",
+                appId, (unsigned long long)state.cn, (unsigned long long)localCN);
+            return;
+        }
+        // Local is ahead: overlay the local manifest ON TOP of the cloud state
+        // (local wins conflicts; cloud-only files from other machines are kept).
+        // The reverse overlay in MergeBatchIntoPublishState keeps cloud wins --
+        // the wrong direction here, so merge manually.
+        auto localManifest = CloudStorage::LoadLocalManifest(accountId, appId);
+        size_t cloudBefore = state.files.size();
+        for (const auto& [name, me] : localManifest) {
+            if (IsReservedBlobFilename(name)) continue;
+            CloudStorage::FileEntry fe;
+            fe.sha = me.sha;
+            fe.timestamp = me.timestamp;
+            fe.size = me.size;
+            state.files[name] = std::move(fe);
+        }
+        state.cn = localCN;
+        if (!CloudStorage::PublishCloudState(accountId, appId, state, /*lockOnly=*/false)) {
+            LOG("[NS-HEAL] app=%u: heal publish failed; will retry next launch", appId);
+            return;
+        }
+        PendingOpsJournal::RecordUploadBatchEnd(accountId, appId);
+        LOG("[NS-HEAL] app=%u: healed -- cloud advanced to CN=%llu (%zu cloud files -> "
+            "%zu after local overlay)", appId, (unsigned long long)localCN,
+            cloudBefore, state.files.size());
+        // Invalidate the full-manifest cache so the next changelist serves the
+        // healed state instead of a cached empty delta.
+        {
+            std::lock_guard<std::mutex> lk(g_fullManifestSentMutex);
+            g_fullManifestSentApps.erase(appKey);
+            g_cachedCloudCN.erase(appKey);
+            g_cachedAppBuildIdHwm.erase(appKey);
+        }
+    }).detach();
+}
 
 // Returns the blob-store file list; Steam compares vs. remotecache.vdf.
 RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqBody) {
@@ -782,6 +853,8 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
             "localCN=%llu, %zu cloud files); returning empty delta at CN=%llu to protect "
             "unpublished local content",
             appId, cloudCN, guardLocalCN, cloudManifest.size(), serverChangeNumber);
+        if (guardLocalCN > cloudCN)
+            MaybeHealCloudDivergence(accountId, appId, guardLocalCN, cloudCN);
     } else if (haveCloudManifest && !cloudManifest.empty()) {
         SetRpcCrashContext("GetChangelist:manifest-delta", "Cloud.GetAppFileChangelist#1", appId);
         // Steam-faithful delta: compute diff between clientCN snapshot and current manifest.
@@ -827,6 +900,8 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
                 LOG("[NS-CL] GetAppFileChangelist app=%u: clientCN=%llu > cloudCN=%llu "
                     "(failed batch), returning empty delta to protect local saves",
                     appId, clientChangeNumber, cloudCN);
+                if (guardLocalCN > cloudCN)
+                    MaybeHealCloudDivergence(accountId, appId, guardLocalCN, cloudCN);
             } else if (alreadySentFull) {
                 // Subsequent call: empty delta (avoids stale SHA/timestamp conflicts).
                 serveBranch = "already-full-empty";
@@ -1128,6 +1203,21 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
                 case ForensicUtil::ServeVerdict::LocalMissing: ++forMissing; break;
                 case ForensicUtil::ServeVerdict::ShaSkipped:   ++forShaSkipped; break;
                 case ForensicUtil::ServeVerdict::NoServedSha:  ++forNoServedSha; break;
+            }
+            // [NS-FOR] ts-guard: an authoritative response (full manifest) that
+            // serves an older cloud blob over a newer local save is a silent
+            // overwrite. Bump the served ts to the local mtime so Steam sees
+            // equal-ts/different-sha and runs its native conflict flow (keep
+            // local / keep remote prompt) instead. Deltas are never touched.
+            if (!responseIsDelta &&
+                forVerdict == ForensicUtil::ServeVerdict::LocalNewer &&
+                forLocal.mtime > fe.timestamp) {
+                LOG("[NS-FOR] ts-guard app=%u file=%s: bumping served ts %llu -> %llu "
+                    "(local save is newer; forcing native conflict flow)",
+                    appId, fe.filename.c_str(),
+                    (unsigned long long)fe.timestamp,
+                    (unsigned long long)forLocal.mtime);
+                fe.timestamp = forLocal.mtime;
             }
             // Per-file lines only for the verdicts that indicate a decision worth
             // inspecting later; MATCH/LOCAL_MISSING stay summary-only.
@@ -2131,7 +2221,11 @@ RpcResult HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqB
     auto deletesCopy = deletes;
 
     std::promise<void> publishPromise;
-    CloudStorage::SetPendingPublish(accountId, appId, publishPromise.get_future().share());
+    // Shared with CompleteBatch's inline wait below; same object registered as
+    // the session-release barrier (which becomes an instant no-op after the
+    // inline wait resolves it).
+    std::shared_future<void> publishFut = publishPromise.get_future().share();
+    CloudStorage::SetPendingPublish(accountId, appId, publishFut);
 
     std::thread([accountId, appId, publishCN, publishBuildId,
                  uploadMetaCopy, filePlatformsCopy, uploadsCopy, deletesCopy,
@@ -2295,9 +2389,19 @@ RpcResult HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqB
             CloudStorage::GarbageCollectBlobs(accountId, appId);
     }).detach();
 
+    // Publish inline (cooperatively pumped): Steam only gets the CompleteBatch
+    // ack once the cloud state is durable or retries are exhausted. Returning
+    // before the publish landed is how a crash-then-relaunch left clientCN >
+    // cloudCN diverged forever. PumpUntil keeps BMainLoop running so the 15s
+    // watchdog doesn't fire while we wait.
+    CoopYield::PumpUntil([publishFut]() {
+        return publishFut.wait_for(std::chrono::seconds(0)) ==
+               std::future_status::ready;
+    });
+
     BatchTracker_Clear(accountId, appId, batch.batchId);
     LOG("[NS] CompleteBatch app=%u CN=%llu returned to Steam in %lldms "
-        "(publish deferred, barrier at session release)",
+        "(publish completed inline before ack)",
         appId, (unsigned long long)newCN, elapsedMs());
     ClearBatchCanonicalTokens(accountId, appId);
 
@@ -2401,6 +2505,33 @@ RpcResult HandleFileDownload(uint32_t appId, const std::vector<PB::Field>& reqBo
                 ForensicUtil::ServeVerdictName(forVerdict),
                 forVerdict == ForensicUtil::ServeVerdict::LocalNewer
                     ? " ** WOULD OVERWRITE NEWER LOCAL **" : "");
+            // [NS-BAK] LOCAL-NEWER on a download: Steam is about to overwrite a
+            // newer local save with an older cloud blob. Snapshot the local file
+            // to <file>.bak first so the progress is never unrecoverable.
+            // *.bak doesn't match the game's save patterns (e.g. *.sav), so the
+            // backup is never re-uploaded.
+            if (forVerdict == ForensicUtil::ServeVerdict::LocalNewer &&
+                forLocal.exists && !forLocalPath.empty()) {
+                if (forLocal.size <= ForensicUtil::kMaxShaFileBytes) {
+                    std::error_code ec;
+                    auto srcPath = FileUtil::Utf8ToPath(forLocalPath);
+                    auto bakPath = FileUtil::Utf8ToPath(forLocalPath + ".bak");
+                    std::filesystem::copy_file(srcPath, bakPath,
+                        std::filesystem::copy_options::overwrite_existing, ec);
+                    if (ec) {
+                        LOG("[NS-BAK] app=%u file=%s: backup failed (%s)",
+                            appId, cleanName.c_str(), ec.message().c_str());
+                    } else {
+                        LOG("[NS-BAK] app=%u file=%s: saved newer local copy to %s.bak "
+                            "(%llu bytes) before cloud overwrite",
+                            appId, cleanName.c_str(), forLocalPath.c_str(),
+                            (unsigned long long)forLocal.size);
+                    }
+                } else {
+                    LOG("[NS-BAK] app=%u file=%s: skipping backup (local size %llu > cap)",
+                        appId, cleanName.c_str(), (unsigned long long)forLocal.size);
+                }
+            }
         }
     }
 
