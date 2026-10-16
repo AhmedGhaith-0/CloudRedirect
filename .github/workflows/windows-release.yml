@@ -1,8 +1,9 @@
 name: Windows build and release
 
-# Builds the native x64 DLL/CLI and the 32-bit 760 tool with MSVC, publishes the
-# single-file WPF app, and for vX.Y.Z[.N] tags creates a GitHub release with the
-# same asset layout as upstream. Linux/Flatpak builds live in linux-release.yml.
+# Builds only the native x64 cloud_redirect.dll with MSVC and, for
+# vX.Y.Z[.N] tags, creates/updates a GitHub release with the DLL and its bare
+# sha256. The UI/CLI/steam_api bundling from upstream is intentionally not
+# built here: consumers (e.g. OpenSteamTool) host the DLL directly.
 
 on:
   push:
@@ -16,14 +17,6 @@ permissions:
   contents: write
 
 env:
-  # ui/native/steam_api.dll is deliberately untracked. Every upstream release
-  # embeds it in CloudRedirect.exe, so CI pulls it out of this pinned release
-  # (see .github/scripts/extract-embedded-pe.ps1) and refuses to build if either
-  # hash changes. Bump all three values together.
-  UPSTREAM_REPO: Selectively11/CloudRedirect
-  UPSTREAM_EXE_TAG: v2.6.5
-  UPSTREAM_EXE_SHA256: d12a85aec6445b96b7777642d58c2412c236623de7f21ed5d8adb65d771d9f23
-  STEAM_API_DLL_SHA256: 5b6ef90f822209180ed5cafecb90af849ee84bcf6281eeb21be2f89b3b5c89b6
   # Upstream builds with Visual Studio 2022 (MSVC 14.44, toolset v143). Pin the
   # same toolset so the native binaries keep the same VC++ Redistributable
   # requirement instead of silently needing the newer runtime that ships with
@@ -53,25 +46,6 @@ jobs:
           Set-Content Version.props -Value $props -NoNewline
           Write-Host "ReleaseVersion set to $version"
 
-      - name: Setup .NET 8
-        uses: actions/setup-dotnet@v5
-        with:
-          dotnet-version: '8.0.x'
-
-      - name: Fetch steam_api.dll from the pinned upstream release
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release download $env:UPSTREAM_EXE_TAG -R $env:UPSTREAM_REPO -p CloudRedirect.exe -D upstream-exe --clobber
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $sha = (Get-FileHash upstream-exe/CloudRedirect.exe -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($sha -ne $env:UPSTREAM_EXE_SHA256) {
-            throw "Upstream CloudRedirect.exe sha256 $sha does not match the pinned $env:UPSTREAM_EXE_SHA256"
-          }
-          ./.github/scripts/extract-embedded-pe.ps1 -Exe upstream-exe/CloudRedirect.exe -OutFile ui/native/steam_api.dll -Machine 0x14C -Dll -ExpectedSha256 $env:STEAM_API_DLL_SHA256
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-
       - name: Detect Visual Studio generator
         id: vs
         shell: pwsh
@@ -87,13 +61,13 @@ jobs:
           Write-Host "Using '$generator' from $($vs[0].installationPath)"
           "generator=$generator" >> $env:GITHUB_OUTPUT
 
-      - name: Build native x64 (cloud_redirect.dll, cloud_redirect_cli.exe)
+      - name: Build native x64 cloud_redirect.dll
         shell: pwsh
         run: |
           $sha = '${{ github.sha }}'.Substring(0, 7)
           cmake -S . -B build -G "${{ steps.vs.outputs.generator }}" -A x64 -T $env:MSVC_TOOLSET "-DCR_GIT_SHA=$sha"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build build --config Release --target cloud_redirect cloud_redirect_cli
+          cmake --build build --config Release --target cloud_redirect
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Build and run fork unit tests
@@ -110,51 +84,10 @@ jobs:
           & build/Release/steam_resolver_tests.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
-      - name: Upload offline Steam compatibility tests
-        uses: actions/upload-artifact@v5
-        with:
-          name: Steam-compatibility-tests-${{ github.sha }}
-          path: |
-            build/Release/steam_message_layout_tests.exe
-            build/Release/steam_resolver_tests.exe
-
-      - name: Build native x86 (cloud760_tool.exe)
-        shell: pwsh
-        run: |
-          $sha = '${{ github.sha }}'.Substring(0, 7)
-          cmake -S . -B build32 -G "${{ steps.vs.outputs.generator }}" -A Win32 -T $env:MSVC_TOOLSET "-DCR_GIT_SHA=$sha"
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build build32 --config Release --target cloud760_tool
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          Copy-Item build32/Release/cloud760_tool.exe ui/native/cloud760_tool.exe
-
-      - name: Publish UI (single-file, framework-dependent)
-        run: dotnet publish ui/CloudRedirect.csproj -c Release -r win-x64 --self-contained false -o ui/bin/publish
-
-      - name: Verify the bundle embeds every native component
-        shell: pwsh
-        run: |
-          $exe = 'ui/bin/publish/CloudRedirect.exe'
-          $checks = @(
-            @{ File = 'build/Release/cloud_redirect.dll';     Machine = 0x8664; Dll = $true  },
-            @{ File = 'build/Release/cloud_redirect_cli.exe'; Machine = 0x8664; Dll = $false },
-            @{ File = 'build32/Release/cloud760_tool.exe';    Machine = 0x14C;  Dll = $false },
-            @{ File = 'ui/native/steam_api.dll';              Machine = 0x14C;  Dll = $true  }
-          )
-          foreach ($c in $checks) {
-            $sha = (Get-FileHash $c.File -Algorithm SHA256).Hash.ToLowerInvariant()
-            ./.github/scripts/extract-embedded-pe.ps1 -Exe $exe -OutFile "verify/$(Split-Path $c.File -Leaf)" -Machine $c.Machine -Dll:$c.Dll -ExpectedSha256 $sha
-            if ($LASTEXITCODE) { throw "$($c.File) is not embedded in $exe" }
-            # Log the MSVC linker version so toolset drift is visible in the run log.
-            $b = [IO.File]::ReadAllBytes($c.File); $lf = [BitConverter]::ToInt32($b, 0x3C)
-            Write-Host ("{0}: MSVC linker {1}.{2}" -f $c.File, $b[$lf + 26], $b[$lf + 27])
-          }
-
       - name: Collect release assets
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item ui/bin/publish/CloudRedirect.exe dist/
           Copy-Item build/Release/cloud_redirect.dll dist/
           foreach ($f in Get-ChildItem dist -File) {
             # Bare hash only: the in-app updater ignores .sha256 files that are not exactly 64 characters.
@@ -162,7 +95,7 @@ jobs:
             Set-Content -Path "$($f.FullName).sha256" -Value $h -NoNewline
           }
           Get-ChildItem dist | Format-Table Name, Length -AutoSize
-          (Get-Item dist/CloudRedirect.exe).VersionInfo | Format-List FileVersion, ProductVersion
+          (Get-Item dist/cloud_redirect.dll).VersionInfo | Format-List FileVersion, ProductVersion
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v5

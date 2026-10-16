@@ -349,7 +349,7 @@ static bool ResolveMessageLayout(uintptr_t slot5, uintptr_t slot8) {
 }
 
 // Use resolved address if available, else 0 (subsystem must gate on this).
-// No hardcoded fallback — a wrong RVA causes silent corruption or crashes.
+// No hardcoded fallback â€” a wrong RVA causes silent corruption or crashes.
 #define SC_RESOLVE(field) (g_resolved.field)
 
 static void RunAutoResolver() {
@@ -1172,7 +1172,7 @@ static void DrainPlaytimeUpdateQueueOnNetThread() {
         ApplyLastPlayedUpdate(body);
 }
 
-// ── Schema-request queue ──────────────────────────────────────────────────
+// â”€â”€ Schema-request queue â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // BAsyncSend requires the network thread (pipe/coroutine TLS). Background threads
 // enqueue (appId, owner) pairs; drained a few per net-thread tick.
 struct SchemaSendItem { uint32_t appId; uint64_t owner; };
@@ -1929,7 +1929,7 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
     return result.eresult == 1;
 }
 
-// ── Native Cloud spy ──────────────────────────────────────────────────────
+// â”€â”€ Native Cloud spy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // CR_SPY_APPID: log native cloud RPCs for a non-namespace app (read-only).
 static uint32_t g_spyAppId = []() -> uint32_t {
     char buf[32] = {0};
@@ -2057,7 +2057,7 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
         return g_originalSlot5(thisptr, methodName, request, response, flags);
     }
 
-    // Third-party: bypass StGate — playtime data should appear in library.
+    // Third-party: bypass StGate â€” playtime data should appear in library.
     if (strcmp(methodName, StatsHandlers::RPC_GET_LAST_PLAYED) == 0
         && (g_cloudSaveOnly.load(std::memory_order_relaxed)
             ? MetadataSync::syncPlaytime.load(std::memory_order_relaxed)
@@ -3842,7 +3842,7 @@ static bool IsSelfUnlockingLua(const std::string& filePath, uint32_t appId) {
 // DLL auto-update: check GitHub for a newer cloud_redirect.dll, replace on disk.
 
 static bool ParseVersion(const std::string& s, int out[4]) {
-    // "2.0.3" or "v2.0.3" ΓåÆ {2, 0, 3}
+    // "2.0.3" or "v2.0.3" Î“Ã¥Ã† {2, 0, 3}
     const char* p = s.c_str();
     if (*p == 'v' || *p == 'V') ++p;
     // Fork releases carry a fourth revision component (vX.Y.Z.N); it is 0 for
@@ -3939,7 +3939,7 @@ static void TryAutoUpdateDll() {
     }
 
     HINTERNET hReq = WinHttpOpenRequest(hConn, L"GET",
-        L"/repos/Anniversor/CloudRedirect/releases",
+        L"/repos/eisora08/CloudRedirect/releases",
         nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
         WINHTTP_FLAG_SECURE);
     if (!hReq) {
@@ -4857,7 +4857,7 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
     if (shouldSeed) {
         if (cloudSaveOnly) {
             // Third-party: apps aren't registered yet (CR_SetApps comes after Init).
-            // Defer seeding — CR_SetApps calls TriggerDeferredSeed once apps arrive.
+            // Defer seeding â€” CR_SetApps calls TriggerDeferredSeed once apps arrive.
             CloudIntercept::SetNeedsSeed(true);
         } else {
             std::thread seed([] {
@@ -5251,7 +5251,7 @@ void InstallReleaseStateNop() {
     LOG("[RelState] Patched to return ERELEASESTATE_RELEASED (4)");
 }
 
-// ── Manifest endpoint override (runtime code patch) ────────────────────
+// â”€â”€ Manifest endpoint override (runtime code patch) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 static void* g_manifestStringsPage = nullptr;
 static uint8_t* g_manifestUrlLeaAddr = nullptr;
@@ -5359,7 +5359,7 @@ void InstallManifestEndpointOverride() {
     }
     LOG("[ManifestEP] Original URL: %.64s", origUrl);
 
-    // Allocate a page within ±2GB for RIP-relative addressing.
+    // Allocate a page within Â±2GB for RIP-relative addressing.
     uintptr_t allocHint = g_payloadBase;
     g_manifestStringsPage = nullptr;
     for (int attempt = 0; attempt < 256 && !g_manifestStringsPage; ++attempt) {
@@ -5456,7 +5456,7 @@ void InstallManifestEndpointOverride() {
         return;
     }
 
-    // 51-byte replacement: lea r8→UA, setopt(USERAGENT), perform, mov esi eax, NOPs
+    // 51-byte replacement: lea r8â†’UA, setopt(USERAGENT), perform, mov esi eax, NOPs
     uint8_t p8bRepl[51];
     p8bRepl[0] = 0x4C; p8bRepl[1] = 0x8D; p8bRepl[2] = 0x05;
     memcpy(p8bRepl + 3, &uaDisp, 4);
@@ -5507,7 +5507,7 @@ void InstallManifestEndpointOverride() {
     LOG("[ManifestEP] Redirected to %s (UA: OpenSteamTool/1.0)", g_manifestEndpoint.c_str());
 }
 
-// ── BAsyncSend inline detour (GamesPlayed rewriting) ───────────────────
+// â”€â”€ BAsyncSend inline detour (GamesPlayed rewriting) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Intercept BAsyncSend to inject game_extra_info into CMsgClientGamesPlayed.
 
 using BAsyncSendFn = uint8_t(__fastcall*)(void* pMsg, uint32_t connHandle);
@@ -5657,7 +5657,7 @@ static uint8_t __fastcall BAsyncSendHook(void* pMsg, uint32_t connHandle) {
     return g_basOriginal(pMsg, connHandle);
 }
 
-// ── Achievement-schema auto-fetch ──────────────────────────────────────
+// â”€â”€ Achievement-schema auto-fetch â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Send 818 (schema_local_version=-1) on behalf of game owners (CM requires ownership).
 // Discovery: category 22 check -> recent reviewers -> fallback accounts.
 
@@ -6369,7 +6369,7 @@ void SetSendPktAddr(void* recvPktGlobalAddr) {
     LOG("[NS] payload_base=%p", (void*)g_payloadBase);
 }
 
-// ── GamesPlayed rewriting ──────────────────────────────────────────────
+// â”€â”€ GamesPlayed rewriting â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Inject game_extra_info so friends see namespace app titles.
 
 static std::mutex g_gameNameCacheMtx;
@@ -6475,7 +6475,7 @@ static std::vector<uint8_t> RewriteGamesPlayed(const uint8_t* body, uint32_t bod
     return {newBody.Data().begin(), newBody.Data().end()};
 }
 
-// OnSendPkt — vtable hook handles namespace Cloud RPCs; this is the fallback path.
+// OnSendPkt â€” vtable hook handles namespace Cloud RPCs; this is the fallback path.
 bool OnSendPkt(void* thisptr, const uint8_t* data, uint32_t size) {
 
     if (!g_cloudRedirectEnabled.load(std::memory_order_relaxed)) return false;
