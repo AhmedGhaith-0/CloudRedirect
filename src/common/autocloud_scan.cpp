@@ -1114,7 +1114,19 @@ ScanResult GetFileList(const std::string& steamPath,
 std::vector<AutoCloudUtil::AutoCloudRuleNative> GetRules(
     const std::string& steamPath, uint32_t appId, uint32_t accountId) {
     (void)accountId;
-    return LoadAutoCloudRules(steamPath, appId, AutoCloudEffectivePlatform::Current);
+    auto rules = LoadAutoCloudRules(steamPath, appId, AutoCloudEffectivePlatform::Current);
+    // Filter to rules that run on our platform, matching native's file scan
+    // (GetFileList skips non-platform rules before building its list). Serving
+    // changelist entries under a foreign-platform root (e.g. MacAppSupport on
+    // Windows) creates phantom remotecache.vdf entries Steam can never resolve
+    // -> permanent "out of sync" badge.
+    std::vector<AutoCloudUtil::AutoCloudRuleNative> out;
+    out.reserve(rules.size());
+    for (auto& r : rules) {
+        if (AutoCloudUtil::AutoCloudRuleMatchesCurrentPlatform(r.platforms))
+            out.push_back(std::move(r));
+    }
+    return out;
 }
 
 // GetRootOverrides - exposes raw rootoverrides for cross-platform mapping
