@@ -248,244 +248,24 @@ endif()
 
 enable_testing()
 
-if(EXISTS ${CMAKE_SOURCE_DIR}/tests/autocloud_native_tests.cpp)
-    add_compile_definitions(CR_RELEASE_VERSION="${CR_RELEASE_VERSION}")
-    if(WIN32)
-        add_executable(autocloud_native_tests
-            tests/autocloud_native_tests.cpp
-            src/common/local_storage.cpp
-            src/common/local_metadata_store.cpp
-        src/common/autocloud_scan.cpp
-        src/common/vdf.cpp
-            src/platform/win/log.cpp
-            src/platform/win/platform_win.cpp
-        )
-        target_include_directories(autocloud_native_tests PRIVATE src/common src/platform/win)
-        target_compile_definitions(autocloud_native_tests PRIVATE CLOUDREDIRECT_TESTING)
-        target_link_libraries(autocloud_native_tests PRIVATE Shlwapi Advapi32 Shell32 Ole32)
-        add_test(NAME autocloud_native_tests COMMAND autocloud_native_tests)
-
-        add_executable(legacy_metadata_cleanup_tests
-            tests/legacy_metadata_cleanup_tests.cpp
-            src/common/legacy_metadata_cleanup.cpp
-            src/platform/win/log.cpp
-            src/platform/win/platform_win.cpp
-        )
-        target_include_directories(legacy_metadata_cleanup_tests PRIVATE src/common src/platform/win)
-        target_compile_definitions(legacy_metadata_cleanup_tests PRIVATE CLOUDREDIRECT_TESTING)
-        target_link_libraries(legacy_metadata_cleanup_tests PRIVATE Shlwapi Advapi32 Shell32 Ole32)
-        add_test(NAME legacy_metadata_cleanup_tests COMMAND legacy_metadata_cleanup_tests)
-    endif()
-
-    add_executable(remotecache_repair_tests
-        tests/remotecache_repair_tests.cpp
-        src/common/remotecache_repair.cpp
-        src/common/vdf.cpp
-    )
-    target_include_directories(remotecache_repair_tests PRIVATE src/common)
-    add_test(NAME remotecache_repair_tests COMMAND remotecache_repair_tests)
-
-    if(EXISTS ${CMAKE_SOURCE_DIR}/tests/sigv4_tests.cpp)
-        add_executable(sigv4_tests
-            tests/sigv4_tests.cpp
-            src/common/sigv4.cpp
-            src/common/sha256_hmac.cpp
-        )
-        target_include_directories(sigv4_tests PRIVATE src/common)
-        add_test(NAME sigv4_tests COMMAND sigv4_tests)
-    endif()
-
-    if(EXISTS ${CMAKE_SOURCE_DIR}/tests/r2_provider_tests.cpp)
-        add_executable(r2_provider_tests
-            tests/r2_provider_tests.cpp
-            src/providers/s3_provider.cpp
-            src/providers/r2_provider.cpp
-            src/common/sigv4.cpp
-            src/common/sha256_hmac.cpp
-        )
-        target_include_directories(r2_provider_tests PRIVATE src/common src/providers)
-        if(WIN32)
-            target_include_directories(r2_provider_tests PRIVATE src/platform/win)
-            target_sources(r2_provider_tests PRIVATE src/platform/win/http_util.cpp)
-        else()
-            target_include_directories(r2_provider_tests PRIVATE src/platform/linux)
-            target_sources(r2_provider_tests PRIVATE src/platform/linux/http_util.cpp)
-        endif()
-        add_test(NAME r2_provider_tests COMMAND r2_provider_tests)
-    endif()
-
-    add_executable(rpc_handlers_tests
-        tests/rpc_handlers_tests.cpp
-        src/common/protobuf.cpp
-    )
-    target_include_directories(rpc_handlers_tests PRIVATE src/common)
-    add_test(NAME rpc_handlers_tests COMMAND rpc_handlers_tests)
-
-    add_executable(batch_merge_tests
-        tests/batch_merge_tests.cpp
-        src/common/batch_merge.cpp
-    )
-    target_include_directories(batch_merge_tests PRIVATE src/common)
-    add_test(NAME batch_merge_tests COMMAND batch_merge_tests)
-
-    add_executable(cloud_staging_tests
-        tests/cloud_staging_tests.cpp
-        src/common/cloud_staging.cpp
-    )
-    target_include_directories(cloud_staging_tests PRIVATE src/common)
-    if(WIN32)
-        target_include_directories(cloud_staging_tests PRIVATE src/platform/win)
-    else()
-        target_include_directories(cloud_staging_tests PRIVATE src/platform/linux)
-    endif()
-    add_test(NAME cloud_staging_tests COMMAND cloud_staging_tests)
-
-    add_executable(cloud_storage_staging_tests
-        tests/cloud_storage_staging_tests.cpp
-        src/common/cloud_work_queue.cpp
-        src/common/cloud_storage.cpp
-        src/common/local_storage.cpp
-        src/common/local_metadata_store.cpp
-        src/common/legacy_metadata_cleanup.cpp
-        src/common/manifest_store.cpp
-        src/common/app_state.cpp
-        src/common/coop_yield.cpp
-        src/common/token_store.cpp
-        src/common/cloud_staging.cpp
-        src/common/pending_ops_journal.cpp
-        src/common/json.cpp
-        src/common/cloud_provider_base.cpp
-        src/common/sigv4.cpp
-        src/common/sha256_hmac.cpp
-        src/common/autocloud_scan.cpp
-        src/common/vdf.cpp
-        src/common/miniz.c
-        src/common/miniz_tdef.c
-        src/common/miniz_tinfl.c
-        src/common/miniz_zip.c
-        src/providers/google_drive.cpp
-        src/providers/onedrive.cpp
-        src/providers/local_disk_provider.cpp
-        src/providers/s3_provider.cpp
-        src/providers/r2_provider.cpp
-    )
-    target_include_directories(cloud_storage_staging_tests PRIVATE src/common src/providers src/testutil)
-    if(WIN32)
-        target_include_directories(cloud_storage_staging_tests PRIVATE src/platform/win)
-        target_sources(cloud_storage_staging_tests PRIVATE
-            src/platform/win/log.cpp
-            src/platform/win/platform_win.cpp
-            src/platform/win/http_util.cpp
-            src/platform/win/http_transport_win.cpp
-            src/platform/win/token_store_win.cpp
-        )
-        target_link_libraries(cloud_storage_staging_tests PRIVATE Shlwapi Advapi32 ws2_32 winhttp Crypt32 Shell32 Ole32)
-    else()
-        target_include_directories(cloud_storage_staging_tests PRIVATE src/platform/linux)
-        target_sources(cloud_storage_staging_tests PRIVATE
-            src/platform/linux/log.cpp
-            src/platform/linux/platform_linux.cpp
-            src/platform/linux/http_util.cpp
-            src/platform/linux/http_transport_linux.cpp
-            src/platform/linux/token_store_linux.cpp
-        )
-        target_link_libraries(cloud_storage_staging_tests PRIVATE pthread dl)
-        if(LINUX_32BIT)
-            target_include_directories(cloud_storage_staging_tests PRIVATE "${DEPS32}/include")
-            target_link_libraries(cloud_storage_staging_tests PRIVATE
-                "${DEPS32}/lib/libcurl.a"
-                "${DEPS32}/lib/libssl.a"
-                "${DEPS32}/lib/libcrypto.a"
-            )
-        endif()
-    endif()
-    add_test(NAME cloud_storage_staging_tests COMMAND cloud_storage_staging_tests)
-
-    add_executable(pending_ops_journal_tests
-        tests/pending_ops_journal_tests.cpp
-        src/common/pending_ops_journal.cpp
-        src/common/json.cpp
-    )
-    target_include_directories(pending_ops_journal_tests PRIVATE src/common)
-    if(WIN32)
-        target_include_directories(pending_ops_journal_tests PRIVATE src/platform/win)
-        target_sources(pending_ops_journal_tests PRIVATE src/platform/win/log.cpp src/platform/win/platform_win.cpp)
-    else()
-        target_include_directories(pending_ops_journal_tests PRIVATE src/platform/linux)
-        target_sources(pending_ops_journal_tests PRIVATE src/platform/linux/log.cpp src/platform/linux/platform_linux.cpp)
-    endif()
-    add_test(NAME pending_ops_journal_tests COMMAND pending_ops_journal_tests)
-
-    add_executable(json_tests
-        tests/json_tests.cpp
-        src/common/json.cpp
-    )
-    target_include_directories(json_tests PRIVATE src/common)
-    add_test(NAME json_tests COMMAND json_tests)
-
-    add_executable(protobuf_tests
-        tests/protobuf_tests.cpp
-        src/common/protobuf.cpp
-    )
-    target_include_directories(protobuf_tests PRIVATE src/common)
-    add_test(NAME protobuf_tests COMMAND protobuf_tests)
-
-    add_executable(vdf_tests
-        tests/vdf_tests.cpp
-        src/common/vdf.cpp
-    )
-    target_include_directories(vdf_tests PRIVATE src/common)
-    add_test(NAME vdf_tests COMMAND vdf_tests)
-
-    add_executable(stats_store_tests
-        tests/stats_store_tests.cpp
-        src/common/stats_store.cpp
-        src/common/json.cpp
-        src/common/metadata_sync.cpp
-        src/common/vdf.cpp
-    )
-    target_include_directories(stats_store_tests PRIVATE src/common)
-    if(WIN32)
-        target_include_directories(stats_store_tests PRIVATE src/platform/win)
-        target_sources(stats_store_tests PRIVATE
-            src/platform/win/log.cpp
-            src/platform/win/platform_win.cpp
-        )
-        target_link_libraries(stats_store_tests PRIVATE Shlwapi Advapi32 Crypt32 Shell32 Ole32)
-    else()
-        target_include_directories(stats_store_tests PRIVATE src/platform/linux)
-        target_sources(stats_store_tests PRIVATE
-            src/platform/linux/log.cpp
-            src/platform/linux/platform_linux.cpp
-            src/platform/linux/file_util.cpp
-        )
-        target_link_libraries(stats_store_tests PRIVATE pthread dl)
-    endif()
-    add_test(NAME stats_store_tests COMMAND stats_store_tests)
+# pending_ops_journal_tests (upstream test file, kept by the fork; moved into
+# tests-fork/) covers the upload journal the anti-loss paths depend on.
+add_executable(pending_ops_journal_tests
+    tests-fork/pending_ops_journal_tests.cpp
+    src/common/pending_ops_journal.cpp
+    src/common/json.cpp
+)
+target_include_directories(pending_ops_journal_tests PRIVATE src/common)
+target_compile_definitions(pending_ops_journal_tests PRIVATE
+    CR_RELEASE_VERSION="${CR_RELEASE_VERSION}")
+if(WIN32)
+    target_include_directories(pending_ops_journal_tests PRIVATE src/platform/win)
+    target_sources(pending_ops_journal_tests PRIVATE src/platform/win/log.cpp src/platform/win/platform_win.cpp)
+else()
+    target_include_directories(pending_ops_journal_tests PRIVATE src/platform/linux)
+    target_sources(pending_ops_journal_tests PRIVATE src/platform/linux/log.cpp src/platform/linux/platform_linux.cpp)
 endif()
-
-# Individually-guarded tests, so a partial tests/ tree still builds.
-if(EXISTS ${CMAKE_SOURCE_DIR}/tests/pending_ops_journal_tests.cpp
-   AND NOT TARGET pending_ops_journal_tests)
-    add_executable(pending_ops_journal_tests
-        tests/pending_ops_journal_tests.cpp
-        src/common/pending_ops_journal.cpp
-        src/common/json.cpp
-    )
-    target_include_directories(pending_ops_journal_tests PRIVATE src/common)
-    # log.cpp needs this; the dormant block above sets it via add_compile_definitions,
-    # which does not reach targets defined out here.
-    target_compile_definitions(pending_ops_journal_tests PRIVATE
-        CR_RELEASE_VERSION="${CR_RELEASE_VERSION}")
-    if(WIN32)
-        target_include_directories(pending_ops_journal_tests PRIVATE src/platform/win)
-        target_sources(pending_ops_journal_tests PRIVATE src/platform/win/log.cpp src/platform/win/platform_win.cpp)
-    else()
-        target_include_directories(pending_ops_journal_tests PRIVATE src/platform/linux)
-        target_sources(pending_ops_journal_tests PRIVATE src/platform/linux/log.cpp src/platform/linux/platform_linux.cpp)
-    endif()
-    add_test(NAME pending_ops_journal_tests COMMAND pending_ops_journal_tests)
-endif()
+add_test(NAME pending_ops_journal_tests COMMAND pending_ops_journal_tests)
 
 # ── Fork tests (tests-fork/) ────────────────────────────────────────────
 add_executable(steam_message_layout_tests tests-fork/steam_message_layout_tests.cpp)
@@ -531,8 +311,7 @@ if(NOT WIN32 AND (LINUX_32BIT OR CMAKE_SIZEOF_VOID_P EQUAL 4))
 endif()
 
 # Pure-logic regression tests for the cross-device playtime merge and the
-# GetUserStats answer. Kept outside tests/ (gitignored upstream) so they are
-# versioned and run by CI.
+# GetUserStats answer (versioned in tests-fork/ and run by CI).
 if(EXISTS ${CMAKE_SOURCE_DIR}/tests-fork/stats_store_fork_tests.cpp)
     add_executable(stats_store_fork_tests
         tests-fork/stats_store_fork_tests.cpp

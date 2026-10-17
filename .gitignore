@@ -2,8 +2,6 @@ build/
 build-*/
 dist/
 build.ps1
-tests/*
-!tests/pending_ops_journal_tests.cpp
 src/testutil/
 docs/
 tools/
