@@ -564,22 +564,5 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests-fork/stats_store_fork_tests.cpp)
     add_test(NAME stats_store_fork_tests COMMAND stats_store_fork_tests)
 endif()
 
-# ── UI (Windows only) ───────────────────────────────────────────────────
-
-if(WIN32)
-    # The csproj expects the DLL/CLI at ../build/Release/; copy from the actual
-    # build output dir so out-of-tree builds (build-win) work correctly.
-    add_custom_target(ui ALL
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_SOURCE_DIR}/build/Release"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "$<TARGET_FILE:cloud_redirect>"
-            "${CMAKE_SOURCE_DIR}/build/Release/cloud_redirect.dll"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "$<TARGET_FILE:cloud_redirect_cli>"
-            "${CMAKE_SOURCE_DIR}/build/Release/cloud_redirect_cli.exe"
-        COMMAND dotnet publish -c Release -r win-x64 --self-contained false -o bin/publish
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/ui
-        COMMENT "Publishing CloudRedirect UI"
-        DEPENDS cloud_redirect cloud_redirect_cli
-    )
-endif()
+# The upstream WPF UI (`ui/`) and Qt UI (`ui-linux/`) are intentionally not
+# maintained in this fork: it ships only the native binaries (DLL/CLI/.so).

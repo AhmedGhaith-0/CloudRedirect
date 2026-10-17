@@ -3,8 +3,8 @@ name: Linux build and release
 # Builds only the 32-bit cloud_redirect.so that hooks Steam on Linux (Steam is
 # 32-bit; built against glibc 2.31 like upstream) and, for vX.Y.Z[.N] tags,
 # attaches it plus its bare sha256 to the GitHub release created by the Windows
-# workflow. The Flatpak/UI/Pages pipeline from upstream is intentionally not
-# built here.
+# workflow. The Flatpak/UI/Pages pipeline from upstream is not maintained in
+# this fork at all.
 
 on:
   push:

@@ -103,10 +103,37 @@ jobs:
           name: CloudRedirect-windows-${{ github.sha }}
           path: dist/*
 
+      - name: Generate release notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          # git writes "fatal: no tag exactly matches..." to stderr when this
+          # is the first release; don't let the default ErrorActionPreference
+          # turn that into a step failure.
+          $ErrorActionPreference = 'Continue'
+          $tag = '${{ github.ref_name }}'
+          $repo = '${{ github.repository }}'
+          # Previous reachable tag (history is linear on master).
+          $prev = git describe --tags --abbrev=0 "$tag^" 2>$null
+          $lines = [System.Collections.Generic.List[string]]::new()
+          $lines.Add("What's Changed")
+          $lines.Add("")
+          if ($LASTEXITCODE -eq 0 -and $prev) {
+              $prev = "$prev".Trim()
+              git log --oneline --no-decorate "$prev..$tag" | ForEach-Object { $lines.Add("$_") }
+              $lines.Add("")
+              $lines.Add("Full Changelog: https://github.com/$repo/compare/$prev...$tag")
+          } else {
+              git log --oneline --no-decorate "$tag" | ForEach-Object { $lines.Add("$_") }
+          }
+          $lines | Set-Content -Path release-notes.md
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Get-Content release-notes.md
+
       - name: Create GitHub release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
-          generate_release_notes: true
+          body_path: release-notes.md
           files: dist/*

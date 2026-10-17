@@ -1,9 +1,0 @@
-[Flatpak Repo]
-Title=CloudRedirect (Anniversor fork)
-Url=https://anniversor.github.io/CloudRedirect/repo
-Homepage=https://github.com/Anniversor/CloudRedirect
-Comment=Steam Cloud redirection magic for Linux!
-Description=CloudRedirect for Linux, built from the Anniversor fork. Redirect Steam Cloud for games unlocked by SLSsteam to the provider of your choice!
-Icon=https://anniversor.github.io/CloudRedirect/repo/icon.svg
-# GPGKey is appended by .github/workflows/linux-release.yml from the
-# FLATPAK_GPG_PRIVATE_KEY secret, so the committed file never carries a key.

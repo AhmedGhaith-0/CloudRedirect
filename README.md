@@ -2,7 +2,7 @@
 
 ""Steam Cloud"" for 'lua' games.
 
-**This the only official source for CloudRedirect. Any other websites are not operated by me or are otherwise endorsed by this project. At least one of those fake sites was actively distributing malware!**
+**Fork of [Anniversor/CloudRedirect](https://github.com/Anniversor/CloudRedirect) that maintains only the native binaries** — the Windows DLL, the 32-bit Linux `.so` and the CLI. The WPF/Qt companion apps, the Flatpak pipeline and the Steam Deck scripts from upstream are intentionally **not** maintained here; hosts like OpenSteamTool deploy the DLL directly. Releases of this fork are the source for the DLL's built-in auto-updater.
 
 > ****This software is experimental and under active development.**** The underlying techniques are fairly insane. What this software tries to do is nuts to attempt. This software could damage your save files and probably will! It could overwrite your saves, cause weird conflicts, make your saves disappear, make you cry. Back up any saves you care about before using this software.
 
@@ -24,15 +24,10 @@ What _this_ tool does is redirect Steam Cloud requests for games that are inject
 
 ## How it works
 
-CloudRedirect for Windows consists of a C++ DLL and a WPF companion app:
+1. The native library (`cloud_redirect.dll` on Windows, `cloud_redirect.so` on Linux) hooks Steam's internal cloud save RPC handlers via ~~vtable interception~~ black magic.
+2. When a lua game attempts to read or write cloud save data, the library intercepts the calls and redirects it. If the game is owned, the game uses normal Steam Cloud as expected. If a lua is present that only unlocks DLC, the game will use normal Steam Cloud.
+3. More dark magic occurs. Saves sync. Bytes flow. This all is visible in the Steam UI and looks identical to normal Steam Cloud functionality.
 
-1. The companion app is used to copy the DLL to your Steam folder and let the user login to their cloud provider.
-2. The DLL hooks Steam's internal cloud save RPC handlers via ~~vtable interception~~ black magic.
-3. When a lua game attempts to read or write cloud save data, the DLL intercepts the calls and redirects it. If the game is owned, the game uses normal Steam Cloud as expected. If a lua is present that only unlocks DLC, the game will use normal Steam Cloud.
-4. More dark magic occurs. Saves sync. Bytes flow. This all is visible in the Steam UI and looks identical to normal Steam Cloud functionality.
-
-Same rough idea on Linux, but involving a flatpak application and a library that is loaded on steam startup instead. 
-   
 ## Supported cloud providers
 
 - **Google Drive**
@@ -41,72 +36,38 @@ Same rough idea on Linux, but involving a flatpak application and a library that
 - **S3-Compatible** - AWS S3, MinIO, Backblaze B2, Wasabi, DigitalOcean Spaces, and any self-hosted S3 server.
 - **Local folder / mapped drive** - by request of literally one user.
 
-With more to come over time. 
+With more to come over time.
 
-## Usage (Windows)
+## Usage
 
-Grab the latest release from the [Releases page](https://github.com/eisora08/CloudRedirect/releases).
+Grab the latest release from the [Releases page](https://github.com/eisora08/CloudRedirect/releases). Each release carries the platform binaries plus bare `sha256` files:
 
-Run the EXE. Pick your mode - STfixer mode for fixes to ST bugs, CloudRedirect mode for the good stuff. In Setup, hit 'Run All Patches'. Go to the Cloud Provider tab, select your provider. If it is a cloud provider, sign in to it.
+- Windows: `cloud_redirect.dll` (+ `.sha256`) — deploy it with your host tool of choice.
+- Linux: `cloud_redirect.so` (+ `.sha256`) — 32-bit, drop-in for your existing SLSsteam/LD_AUDIT setup.
 
-That's it. Go launch Steam and watch the magic.
-
-## Usage (Linux)
-
-Edit your SLSsteam config, set DisableCloud to No. 
-
-
-```curl -fsSL headcrab.pages.dev | bash```
-
-That installs upstream's Flatpak. To get this fork's builds (and its updates) instead, point the `cloudredirect` remote at this fork's repo once, in a terminal on the device:
-
-```
-flatpak remote-delete --user --force cloudredirect
-flatpak remote-add --user cloudredirect https://anniversor.github.io/CloudRedirect/cloudredirect.flatpakrepo
-flatpak update --user -y org.cloudredirect.CloudRedirect
-```
-
-The repo is GPG-signed by CI (the descriptor carries the public key). If you ever need to skip verification, `flatpak remote-add --user --no-gpg-verify cloudredirect https://anniversor.github.io/CloudRedirect/repo` works too.
-
-Then open the app, press Update on the dashboard so the bundled `cloud_redirect.so` is deployed, and restart Steam. Every release also carries `CloudRedirect-linux-x86_64.flatpak` for offline installs (`flatpak install --user ./CloudRedirect-linux-x86_64.flatpak`).
-
-If you keep SLSsteam and the pinned Steam client up to date with the [headcrab](https://github.com/Deadboy666/h3adcr-b) script, use this fork's wrapper instead of the "Headcrab Updater" menu entry: it runs headcrab behind `wget`/`curl`/`flatpak` shims that send every download of `cloud_redirect.so`, `cloud_redirect_cli` or `cloudredirect.flatpakrepo` to this fork (the shims key on those file names, so they do not care how upstream's script is written or where it hosts the files; the unpatched script overwrites the deployed `cloud_redirect.so` with upstream's build every run), then redeploys the Flatpak's library anyway and installs itself as "CloudRedirect (fork) Updater" in the application menu:
-
-```
-curl -fsSL https://raw.githubusercontent.com/Anniversor/CloudRedirect/master/linux/deck-update.sh | bash
-```
-
-`cr-deck-update.sh --skip-headcrab` only switches the remote, updates the Flatpak and redeploys the library.
-
-Open the CloudRedirect app, sign into a provider.
-
-Edit your SLS config. The games you want to sync must be specified under AdditionalApps in your SLS config. This requirement will go away in the future. 
-
-Now launch Steam and watch your games sync!
+The built-in updater polls this fork's releases, so once a newer tag ships, the deployed library upgrades itself on the next Steam launch.
 
 ## Building from source (Windows)
 
 ### Prerequisites
 
-- Visual Studio 2022 (or Build Tools) with the C++ and .NET 8 workloads
+- Visual Studio 2022 (or Build Tools) with the C++ workload
 - CMake 3.20+
 
 ### Build
 
 ```bash
 cmake -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Release
+cmake --build build --config Release --target cloud_redirect
 ```
 
-This builds both the C++ DLL (`build/Release/cloud_redirect.dll`) and publishes the WPF app (`ui/bin/publish/CloudRedirect.exe`). The DLL is automatically embedded into the executable.
-
-Or don't build it? Building Windows apps is pain.
+This builds the x64 DLL (`build/Release/cloud_redirect.dll`). The fork's unit tests are separate targets (`stats_store_fork_tests`, `autocloud_injection_tests`, `steam_message_layout_tests`, `steam_resolver_tests`).
 
 ## Building from source (Linux)
 
-Oooooh boy. Yeah. Have fun. 
+Oooooh boy. Yeah. Have fun.
 
-You need to build against glibc 2.31 or older. Ubuntu 20.04 would work, if you dislike yourself. There's also an ancient version of Fedora that fits the bill. Or Debian 11. Distrobox is the way, here. Don't even bother trying to build under whatever distro you daily, you'll wind up fighting it for no reason. Distrobox exists for a reason. 
+You need to build against glibc 2.31 or older. Ubuntu 20.04 would work, if you dislike yourself. There's also an ancient version of Fedora that fits the bill. Or Debian 11. Distrobox is the way, here. Don't even bother trying to build under whatever distro you daily, you'll wind up fighting it for no reason. Distrobox exists for a reason.
 
 If you are building under Ubuntu 20.04, GCC 12 is needed along with the 32-bit multilib stuff. System cmake is ancient garbage, you'll have to update it.
 
@@ -116,6 +77,4 @@ Isn't building for weird distros _fun?_
 
 ## Contibuting
 
-CloudRedirect is open source. I welcome PRs. I love PRs.
-
-I don't _love_ downstream forks. You have a right to fork and do what you want, but if you make something useful, if you fix issues...I'd much prefer they be sent upstream! Help me help you! If you identify a problem/add a provider/improve the tool in any way, please consider submitting your changes as a PR, rather than keeping them in a downstream fork.
+PRs welcome — fixes to the native library, new cloud providers and tests all belong upstream-or-here; this fork specifically exists to ship the binaries with its own release cadence.
