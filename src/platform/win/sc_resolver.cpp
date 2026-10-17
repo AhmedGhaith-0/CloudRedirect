@@ -769,53 +769,66 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
             LOG("[Resolver] PlaytimeWriter: not resolved");
     }
 
-    // Phase 12: PbMsgCtor — loads CProtoBufMsgBase vtable via RTTI, stores to [rcx],
-    // and has `mov [rcx+38h], r8d` (44 89 41 38) at +0x0A.
+    // Phase 12: PbMsgCtor — prologue + or edx,80000000h + LEA CProtoBufMsgBase vtable.
+    // Steam 11.12.30.07 (Oct 2026): old `mov [rcx+38h],r8d` anchor became
+    // `mov [rdi+40h],r8d` at +0x3A; emsg now stored at [rdi+28h]. The 10-byte
+    // prologue alone has ~229 hits; the or-edx + vtable-LEA checks make it unique
+    // (copy ctors at d1c020/d1c200 fail the prologue byte at +5; d1c760 fails +9).
     {
         uintptr_t baseMsgVtable = SigScanner::ResolveVtableByRtti(".?AVCProtoBufMsgBase@@");
         if (baseMsgVtable) {
-            // PbMsgCtor: sub rsp,30h then LEA rax, CProtoBufMsgBase_vt; mov [rcx], rax
-            // Unique anchor: 44 89 41 38 (mov [rcx+38h], r8d) at offset +0x0A
-            // Full prologue: 48 89 5C 24 08 57 48 83 EC 30 44 89 41 38
             static const uint8_t pat[] = {
                 0x48, 0x89, 0x5C, 0x24, 0x08,  // mov [rsp+8], rbx
                 0x57,                           // push rdi
                 0x48, 0x83, 0xEC, 0x30,         // sub rsp, 30h
-                0x44, 0x89, 0x41, 0x38,         // mov [rcx+38h], r8d
             };
-            static const char mask[] = "xxxxxxxxxxxxxx";
-            uintptr_t hit = SigScanner::FindPattern(pat, mask, 14);
-            if (hit) {
-                // Verify it LEAs the CProtoBufMsgBase vtable within the next 10 bytes
-                uintptr_t leaTarget = SigScanner::FindFirstRipRelLeaTarget(hit + 14, 10);
-                if (leaTarget == baseMsgVtable) {
-                    r.pbMsgCtor = hit;
-                    LOG("[Resolver] PbMsgCtor @ %p (RVA 0x%llX) via signature + vtable verify",
-                        (void*)hit, (uint64_t)(hit - steamClientBase));
-                }
-            }
-            if (!r.pbMsgCtor)
-                LOG("[Resolver] PbMsgCtor: not resolved");
-
-            // Phase 13: PbMsgCleanup — push rbx; sub rsp, 20h; lea rax, CProtoBufMsgBase_vt
-            // Pattern: 40 53 48 83 EC 20 48 8D 05 XX XX XX XX 48 8B D9
-            // where the LEA target == baseMsgVtable
+            static const uint8_t orEdx[] = { 0x81, 0xCA, 0x00, 0x00, 0x00, 0x80 }; // or edx, 80000000h
             const auto* text = reinterpret_cast<const uint8_t*>(SigScanner::GetTextBase());
             size_t textSize = SigScanner::GetTextSize();
             __try {
-                for (size_t i = 0; i + 16 <= textSize; ++i) {
-                    if (text[i] == 0x40 && text[i+1] == 0x53 &&
-                        text[i+2] == 0x48 && text[i+3] == 0x83 && text[i+4] == 0xEC && text[i+5] == 0x20 &&
-                        text[i+6] == 0x48 && text[i+7] == 0x8D && text[i+8] == 0x05) {
-                        int32_t disp = *reinterpret_cast<const int32_t*>(text + i + 9);
-                        uintptr_t instrAddr = SigScanner::GetTextBase() + i + 6;
-                        uintptr_t target = instrAddr + 7 + disp;
-                        if (target == baseMsgVtable) {
-                            r.pbMsgCleanup = SigScanner::GetTextBase() + i;
-                            LOG("[Resolver] PbMsgCleanup @ %p (RVA 0x%llX) via prologue + vtable LEA",
-                                (void*)r.pbMsgCleanup, (uint64_t)(r.pbMsgCleanup - steamClientBase));
-                            break;
-                        }
+                for (size_t i = 0; i + 48 <= textSize; ++i) {
+                    if (memcmp(text + i, pat, 10) != 0) continue;
+                    bool hasOr = false;
+                    for (size_t j = i + 10; j + 6 <= i + 34; ++j) {
+                        if (memcmp(text + j, orEdx, 6) == 0) { hasOr = true; break; }
+                    }
+                    if (!hasOr) continue;
+                    uintptr_t hit = SigScanner::GetTextBase() + i;
+                    uintptr_t leaTarget = SigScanner::FindFirstRipRelLeaTarget(hit + 10, 40);
+                    if (leaTarget == baseMsgVtable) {
+                        r.pbMsgCtor = hit;
+                        LOG("[Resolver] PbMsgCtor @ %p (RVA 0x%llX) via prologue + or-edx + vtable verify",
+                            (void*)hit, (uint64_t)(hit - steamClientBase));
+                        break;
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            if (!r.pbMsgCtor)
+                LOG("[Resolver] PbMsgCtor: not resolved");
+
+            // Phase 13: PbMsgCleanup (dtor body, non-freeing) — Steam 11.12.30.07:
+            // mov [rsp+8],rbx; push rdi; sub rsp,20h; cmp byte [rcx+19h],0;
+            // lea rax, CProtoBufMsgBase_vt. The 17-byte pattern is unique in .text.
+            // NOTE: vtable[0] is the deleting wrapper (calls this + operator delete
+            // with size 0x50) — never call vtable[0] directly (stack misbalance).
+            static const uint8_t pat13[] = {
+                0x48, 0x89, 0x5C, 0x24, 0x08,  // mov [rsp+8], rbx
+                0x57,                           // push rdi
+                0x48, 0x83, 0xEC, 0x20,         // sub rsp, 20h
+                0x80, 0x79, 0x19, 0x00,         // cmp byte [rcx+19h], 0
+                0x48, 0x8D, 0x05,               // lea rax, [rip+...]
+            };
+            __try {
+                for (size_t i = 0; i + 21 <= textSize; ++i) {
+                    if (memcmp(text + i, pat13, 17) != 0) continue;
+                    int32_t disp = *reinterpret_cast<const int32_t*>(text + i + 17);
+                    uintptr_t instrAddr = SigScanner::GetTextBase() + i + 14;
+                    uintptr_t target = instrAddr + 7 + disp;
+                    if (target == baseMsgVtable) {
+                        r.pbMsgCleanup = SigScanner::GetTextBase() + i;
+                        LOG("[Resolver] PbMsgCleanup @ %p (RVA 0x%llX) via prologue + vtable LEA",
+                            (void*)r.pbMsgCleanup, (uint64_t)(r.pbMsgCleanup - steamClientBase));
+                        break;
                     }
                 }
             } __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -826,7 +839,11 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
         }
     }
 
-    // Phase 14: PbMsgFinalize — string xref "!m_pProtoBufBody" + cmp [rcx+30h] guard.
+    // Phase 14: PbMsgFinalize — string xref "!m_pProtoBufBody" + cmp [rcx+38h] guard.
+    // Steam 11.12.30.07: body field moved +0x30→+0x38; the guard follows the field.
+    // Discriminate finalize (loads descriptor from [rbx+8], calls CreateInstance
+    // via [rax+10h]) from SetBody (takes body in rdx, no descriptor load):
+    // require mov rcx,[rbx+8] (48 8B 4B 08) within the first 0x50 bytes.
     {
         const char* searchStr = "!m_pProtoBufBody";
         size_t searchLen = strlen(searchStr);
@@ -842,8 +859,8 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
         if (strAddr) {
             const auto* text = reinterpret_cast<const uint8_t*>(SigScanner::GetTextBase());
             size_t textSize = SigScanner::GetTextSize();
-            // Check bytes: 48 83 79 30 00 = cmp qword ptr [rcx+30h], 0
-            static const uint8_t cmpPat[] = { 0x48, 0x83, 0x79, 0x30, 0x00 };
+            // cmp qword ptr [rcx+38h], 0 (body-moved guard)
+            static const uint8_t cmpPat[] = { 0x48, 0x83, 0x79, 0x38, 0x00 };
 
             __try {
                 for (size_t i = 0; i + 7 <= textSize; ++i) {
@@ -860,13 +877,23 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
                             if (candidate < SigScanner::GetTextBase()) break;
                             if (!SigScanner::LooksLikeFunctionStart(candidate)) continue;
 
-                            // Verify: cmp [rcx+30h], 0 within first 13 bytes (prologue + guard)
+                            // Verify: cmp [rcx+38h], 0 within first 13 bytes (prologue + guard)
                             const uint8_t* fn = reinterpret_cast<const uint8_t*>(candidate);
                             bool hasCmp = false;
                             for (int off = 0; off <= 8; off++) {
                                 if (memcmp(fn + off, cmpPat, 5) == 0) { hasCmp = true; break; }
                             }
                             if (!hasCmp) break; // wrong function, try next xref
+
+                            // Discriminator: finalize loads descriptor [rbx+8]
+                            bool hasDescLoad = false;
+                            for (int off = 0; off + 4 <= 0x50; off++) {
+                                if (fn[off] == 0x48 && fn[off+1] == 0x8B &&
+                                    fn[off+2] == 0x4B && fn[off+3] == 0x08) {
+                                    hasDescLoad = true; break;
+                                }
+                            }
+                            if (!hasDescLoad) break; // SetBody-like, try next xref
 
                             r.pbMsgFinalize = candidate;
                             break;
@@ -1091,9 +1118,9 @@ void LogComparison(const ResolvedAddrs& r, uintptr_t base) {
     logEntry("ReadConfigU64",          r.readConfigU64,           0x4A93F0);
     logEntry("BAsyncSend",             r.bAsyncSend,              0xCFCDD0);
     logEntry("PlaytimeWriter",         r.playtimeWriter,          0x9CFDA0);
-    logEntry("PbMsgCtor",              r.pbMsgCtor,               0xCFC7D0);
-    logEntry("PbMsgFinalize",          r.pbMsgFinalize,           0xCFF370);
-    logEntry("PbMsgCleanup",           r.pbMsgCleanup,            0xCFCA80);
+    logEntry("PbMsgCtor",              r.pbMsgCtor,               0xD1C350);
+    logEntry("PbMsgFinalize",          r.pbMsgFinalize,           0xD21D50);
+    logEntry("PbMsgCleanup",           r.pbMsgCleanup,            0xD1C760);
     logEntry("YieldIfTimeSlice",       r.yieldIfTimeSlice,        0xCF2AC0);
     logEntry("GetUserStatsVtable",     r.getUserStatsVtable,      0x1347988);
     logEntry("GetUserStatsDesc",       r.getUserStatsDesc,        0x16F8830);

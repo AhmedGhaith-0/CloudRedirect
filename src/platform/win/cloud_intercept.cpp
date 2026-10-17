@@ -107,11 +107,15 @@ static constexpr size_t SC_BDD_STOLEN_BYTES = 14;  // first 14 bytes of prologue
 // Hooks this to inject game_extra_info into CMsgClientGamesPlayed before serialization.
 static constexpr uintptr_t SC_RVA_BASYNC_SEND = 0xCF9590;
 static constexpr size_t SC_BAS_STOLEN_BYTES = 15;   // 5+5+1+4 bytes of prologue
-// CProtoBufMsg layout offsets
+// CProtoBufMsg layout offsets — Steam 11.12.30.07 (Oct 2026, verified by disasm):
+//   +0x00 vtable, +0x08 descriptor*, +0x18 owns-flag(byte=1),
+//   +0x24 -1, +0x28 emsg|PROTO_FLAG, +0x30 header*(CMsgProtoBufHeader),
+//   +0x38 body*(MessageLite, finalize-allocated), +0x40 a3, object size 0x50.
 static constexpr uint32_t CPROTOBUFMSG_OFF_DESC   = 0x08;  // typed-body descriptor vtable*
-static constexpr uint32_t CPROTOBUFMSG_OFF_CONN   = 0x1C;  // uint32_t connection handle
-static constexpr uint32_t CPROTOBUFMSG_OFF_EMSG   = 0x20;  // uint32_t EMsg | PROTO_FLAG
-static constexpr uint32_t CPROTOBUFMSG_OFF_BODY   = 0x30;  // protobuf body object*
+static constexpr uint32_t CPROTOBUFMSG_OFF_CONN   = 0x1C;  // uint32_t connection handle (unverified in 11.12.30.07; vestigial — BAsyncSend takes conn as param)
+static constexpr uint32_t CPROTOBUFMSG_OFF_EMSG   = 0x28;  // uint32_t EMsg | PROTO_FLAG
+static constexpr uint32_t CPROTOBUFMSG_OFF_HDR    = 0x30;  // CMsgProtoBufHeader* (ctor-allocated)
+static constexpr uint32_t CPROTOBUFMSG_OFF_BODY   = 0x38;  // protobuf body object*
 
 // g_pJobCur (qword_1397E02C0): current CJob coroutine. CJobID at CJob+32.
 // Only valid on BMainLoop/job thread (yield primitives assert g_pJobCur != NULL).
@@ -125,9 +129,9 @@ static constexpr uintptr_t SC_RVA_YIELD_IF_TIMESLICE = 0xCEF280;
 // Schema-fetch injection: send EMsg 818 (schema_local_version=-1) on behalf of
 // an owning SteamID; server replies with 819 -> UserGameStatsSchema_<appid>.bin.
 // RVAs from CAPIJobRequestUserStats (sub_138A45010).
-static constexpr uintptr_t SC_RVA_PBMSG_CTOR      = 0xCFC7D0;   // CProtoBufMsgBase::ctor(this, emsg, 0)
-static constexpr uintptr_t SC_RVA_PBMSG_FINALIZE  = 0xCFF370;   // allocate typed body (sub_138CFF370)
-static constexpr uintptr_t SC_RVA_PBMSG_CLEANUP   = 0xCFCA80;   // destroy msg
+static constexpr uintptr_t SC_RVA_PBMSG_CTOR      = 0xD1C350;   // CProtoBufMsgBase::ctor(this, emsg, 0) [11.12.30.07]
+static constexpr uintptr_t SC_RVA_PBMSG_FINALIZE  = 0xD21D50;   // allocate typed body [11.12.30.07]
+static constexpr uintptr_t SC_RVA_PBMSG_CLEANUP   = 0xD1C760;   // destroy msg [11.12.30.07]
 static constexpr uintptr_t SC_RVA_GETUSERSTATS_DESC = 0x16F8830; // CMsgClientGetUserStats body descriptor
 // Typed vtable for CProtoBufMsg<CMsgClientGetUserStats>.
 // Must be at msg[0] after base ctor; base vftable -> serialization crash.
@@ -160,9 +164,9 @@ static constexpr uintptr_t SC_RVA_SET_APP_LAST_PLAYED_TIME = 0x9D6A70;
 // Live playtime update: synthesized GetLastPlayedTimes response.
 // Build 1784669098 RVAs:
 static constexpr uintptr_t SC_RVA_PLAYTIME_WRITER    = 0x9CFDA0;
-static constexpr uintptr_t SC_RVA_MSG_CTOR           = 0xCFC7D0;
-static constexpr uintptr_t SC_RVA_MSG_INIT           = 0xCFF370;  // unused; same as PBMSG_FINALIZE
-static constexpr uintptr_t SC_RVA_MSG_DTOR           = 0xCFCA80;
+static constexpr uintptr_t SC_RVA_MSG_CTOR           = 0xD1C350;   // [11.12.30.07]
+static constexpr uintptr_t SC_RVA_MSG_INIT           = 0xD21D50;  // unused; same as PBMSG_FINALIZE
+static constexpr uintptr_t SC_RVA_MSG_DTOR           = 0xD1C760;
 static constexpr uintptr_t SC_RVA_RESP_DESCRIPTOR    = 0x16D5590;
 static constexpr uintptr_t SC_RVA_RESP_WRAPPER_VT    = 0x1334340;
 // off_1396E8248: pointer to "Software\\Valve\\Steam\\LastPlayedTimesSyncTime"
@@ -1537,7 +1541,7 @@ static void ApplyLastPlayedUpdate(const std::vector<uint8_t>& respBody) {
         return;
     }
 
-    // Stack CProtoBufMsg: [0]=vtable, [1]=descriptor, [6]=inner body (from init).
+    // Stack CProtoBufMsg: [0]=vtable, [1]=descriptor, [7]=inner body (from init).
     uintptr_t wrapper[11] = {0};
     using MsgCtorFn = void(__fastcall*)(void* self, int a2, int a3);
     using MsgInitFn = void(__fastcall*)(void* self);
@@ -1566,7 +1570,7 @@ static void ApplyLastPlayedUpdate(const std::vector<uint8_t>& respBody) {
         wrapper[1] = descAddr;
         msgInit(wrapper);
 
-        uintptr_t inner = wrapper[6]; // m_pProtoBufBody (the inner MessageLite)
+        uintptr_t inner = wrapper[7]; // m_pProtoBufBody at +0x38 (11.12.30.07 layout)
         if (!inner) {
             LOG("[Stats] ApplyLastPlayedUpdate: inner body alloc failed");
             msgDtor(wrapper);
@@ -5565,7 +5569,7 @@ static uint8_t __fastcall BAsyncSendHook(void* pMsg, uint32_t connHandle) {
         }
         // Capture session fields from any outgoing message for injected 818s.
         if (!g_hdrCaptured.load(std::memory_order_relaxed)) {
-            void* ownHdr = *(void**)((uintptr_t)pMsg + 0x28);
+            void* ownHdr = *(void**)((uintptr_t)pMsg + CPROTOBUFMSG_OFF_HDR);
             if (ownHdr) {
                 uint8_t* hb = (uint8_t*)ownHdr;
                 uint64_t sid = *(uint64_t*)(hb + 104);
@@ -5984,7 +5988,7 @@ static bool SendSchemaRequest(uint32_t appId, uint64_t ownerId, uint32_t connHan
     g_pbMsgCtor(msg, (int)EMSG_CLIENT_GET_USER_STATS, 0);     // base ctor: emsg=818
     *(void**)(msg + 0) = g_getUserStatsVtbl;                  // install typed vftable
     *(void**)(msg + CPROTOBUFMSG_OFF_DESC) = g_getUserStatsDesc; // typed-body descriptor
-    g_pbMsgFinalize(msg);                                      // allocate body at +0x30
+    g_pbMsgFinalize(msg);                                      // allocate body at +0x38
 
     void* body = *(void**)(msg + CPROTOBUFMSG_OFF_BODY);
     if (!body) { g_pbMsgCleanup(msg); return false; }
@@ -5994,7 +5998,7 @@ static bool SendSchemaRequest(uint32_t appId, uint64_t ownerId, uint32_t connHan
     //  2. Session fields (steamid, sessionid, realm, jobid_source): CM drops without.
     // Offsets: +104 steamid, +112 sessionid, +156 realm, +208 jobid_source
     static std::atomic<uint64_t> s_jobIdCounter{0x5C00000000000001ull};
-    if (void* hdr = *(void**)(msg + 0x28)) {
+    if (void* hdr = *(void**)(msg + CPROTOBUFMSG_OFF_HDR)) {
         uint8_t* h = (uint8_t*)hdr;
         *(int32_t*)(h + 192) = -1;                         // expiry = -1 (no deadline)
         *(uint32_t*)(h + 16) &= ~0x4000000u;               // clear "no reply expected"
