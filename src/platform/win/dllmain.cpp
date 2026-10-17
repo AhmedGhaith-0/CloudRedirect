@@ -3,7 +3,6 @@
 #include "cloud_intercept.h"
 #include "metadata_sync.h"
 #include "file_util.h"
-#include "cli.h"
 #include "steam_kv_injector.h"
 #include <atomic>
 #include <mutex>

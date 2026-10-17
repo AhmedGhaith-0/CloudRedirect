@@ -2,7 +2,7 @@ name: Windows build and release
 
 # Builds only the native x64 cloud_redirect.dll with MSVC and, for
 # vX.Y.Z[.N] tags, creates/updates a GitHub release with the DLL and its bare
-# sha256. The UI/CLI/steam_api bundling from upstream is intentionally not
+# sha256. The UI/steam_api bundling from upstream is intentionally not
 # built here: consumers (e.g. OpenSteamTool) host the DLL directly.
 
 on:

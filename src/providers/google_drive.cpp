@@ -1315,7 +1315,7 @@ GoogleDriveProvider::List(const std::string& prefix) {
 
 bool GoogleDriveProvider::ListSubfoldersChecked(const std::string& prefix,
                                                 std::vector<std::string>& outFolders) {
-    // Used by CLI list-remote-app-ids to avoid full recursive enumeration.
+    // Account-level enumeration without a full recursive listing.
     outFolders.clear();
 
     uint32_t accountId, appId;

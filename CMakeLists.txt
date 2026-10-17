@@ -72,7 +72,6 @@ set(COMMON_SOURCES
     src/common/local_storage.cpp
     src/common/local_metadata_store.cpp
     src/common/legacy_metadata_cleanup.cpp
-    src/common/cli.cpp
     src/common/cloud_provider_base.cpp
     src/common/sigv4.cpp
     src/common/sha256_hmac.cpp
@@ -158,19 +157,6 @@ if(WIN32)
     target_link_libraries(cloud_redirect PRIVATE
         Shlwapi Advapi32 ws2_32 winhttp Crypt32 Shell32 Ole32 Psapi
     )
-    
-    # CLI wrapper executable
-    add_executable(cloud_redirect_cli
-        src/platform/win/cli_main.cpp
-    )
-    target_link_libraries(cloud_redirect_cli PRIVATE Shell32 Ole32)
-    # Ensure DLL is built before CLI
-    add_dependencies(cloud_redirect_cli cloud_redirect)
-
-    # Standalone Steam Cloud file manager for a single AppID (default 760).
-    add_executable(cloud760_tool
-        src/platform/win/cloud760_tool.cpp
-    )
 else()
     target_include_directories(cloud_redirect PRIVATE src/platform/linux)
     target_link_libraries(cloud_redirect PRIVATE dl pthread)
@@ -227,20 +213,6 @@ else()
     # Strip in release
     if(CMAKE_BUILD_TYPE STREQUAL "Release")
         target_link_options(cloud_redirect PRIVATE -s)
-    endif()
-
-    # CLI wrapper (32-bit loader for cloud_redirect.so)
-    add_executable(cloud_redirect_cli
-        src/platform/linux/cli_main.cpp
-    )
-    target_link_libraries(cloud_redirect_cli PRIVATE dl)
-    if(LINUX_32BIT)
-        target_compile_options(cloud_redirect_cli PRIVATE -m32)
-        target_link_options(cloud_redirect_cli PRIVATE -m32)
-    endif()
-    add_dependencies(cloud_redirect_cli cloud_redirect)
-    if(CMAKE_BUILD_TYPE STREQUAL "Release")
-        target_link_options(cloud_redirect_cli PRIVATE -s)
     endif()
 endif()
 
@@ -344,4 +316,4 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests-fork/stats_store_fork_tests.cpp)
 endif()
 
 # The upstream WPF UI (`ui/`) and Qt UI (`ui-linux/`) are intentionally not
-# maintained in this fork: it ships only the native binaries (DLL/CLI/.so).
+# maintained in this fork: it ships only the native binaries (DLL/.so).
