@@ -76,6 +76,33 @@ inline ServeVerdict ClassifyServeVerdict(const LocalFileInfo& local,
     return ServeVerdict::CloudNewer;
 }
 
+// [NS-FOR ts-guard] An authoritative response (full manifest) that serves an
+// older cloud blob over a newer local save is a silent overwrite. Returns the
+// timestamp to serve: bumped to the local mtime so Steam sees equal-ts /
+// different-sha and runs its native conflict flow (keep local / keep remote
+// prompt) instead. Returns 0 when the served ts must be left alone. Deltas are
+// never touched (the changelist already carries authoritative timestamps).
+inline uint64_t TsGuardBumpServedTs(bool responseIsDelta, ServeVerdict verdict,
+                                    uint64_t localMtime, uint64_t servedTs) {
+    if (responseIsDelta) return 0;
+    if (verdict != ServeVerdict::LocalNewer) return 0;
+    if (localMtime <= servedTs) return 0;
+    return localMtime;
+}
+
+// [NS-BAK] LOCAL-NEWER on a download: Steam is about to overwrite a newer
+// local save with an older cloud blob. Snapshot the local file to <file>.bak
+// first so the progress is never unrecoverable. (*.bak doesn't match the
+// game's save patterns, so the backup is never re-uploaded.) True when a
+// backup must be written; false when skipped (other verdict, no local file,
+// or local size over the backup cap).
+inline bool ShouldBackupBeforeOverwrite(ServeVerdict verdict, bool localExists,
+                                        uint64_t localSize,
+                                        uint64_t maxBackupBytes) {
+    return verdict == ServeVerdict::LocalNewer && localExists &&
+           localSize <= maxBackupBytes;
+}
+
 // Lowercase hex of the full SHA-1 (40 chars); empty input -> empty string.
 inline std::string ShaHex(const std::vector<uint8_t>& sha) {
     static const char* kHex = "0123456789abcdef";

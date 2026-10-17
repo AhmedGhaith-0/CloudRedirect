@@ -13,6 +13,7 @@
 #include "app_state.h"
 #include "cloud_storage.h"
 #include "forensic_util.h"
+#include "heal_overlay_util.h"
 #include "coop_yield.h"
 #include "pending_ops_journal.h"
 #include "file_util.h"
@@ -605,19 +606,12 @@ static void MaybeHealCloudDivergence(uint32_t accountId, uint32_t appId,
         }
         // Local is ahead: overlay the local manifest ON TOP of the cloud state
         // (local wins conflicts; cloud-only files from other machines are kept).
-        // The reverse overlay in MergeBatchIntoPublishState keeps cloud wins --
-        // the wrong direction here, so merge manually.
+        // Direction rationale lives with the helper (heal_overlay_util.h): the
+        // reverse overlay in MergeBatchIntoPublishState keeps cloud wins --
+        // the wrong direction here.
         auto localManifest = CloudStorage::LoadLocalManifest(accountId, appId);
         size_t cloudBefore = state.files.size();
-        for (const auto& [name, me] : localManifest) {
-            if (IsReservedBlobFilename(name)) continue;
-            CloudStorage::FileEntry fe;
-            fe.sha = me.sha;
-            fe.timestamp = me.timestamp;
-            fe.size = me.size;
-            state.files[name] = std::move(fe);
-        }
-        state.cn = localCN;
+        HealOverlayLocalOntoCloud(state, localManifest, localCN);
         if (!CloudStorage::PublishCloudState(accountId, appId, state, /*lockOnly=*/false)) {
             LOG("[NS-HEAL] app=%u: heal publish failed; will retry next launch", appId);
             return;
@@ -1209,15 +1203,14 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
             // overwrite. Bump the served ts to the local mtime so Steam sees
             // equal-ts/different-sha and runs its native conflict flow (keep
             // local / keep remote prompt) instead. Deltas are never touched.
-            if (!responseIsDelta &&
-                forVerdict == ForensicUtil::ServeVerdict::LocalNewer &&
-                forLocal.mtime > fe.timestamp) {
+            if (uint64_t bumpedTs = ForensicUtil::TsGuardBumpServedTs(
+                    responseIsDelta, forVerdict, forLocal.mtime, fe.timestamp)) {
                 LOG("[NS-FOR] ts-guard app=%u file=%s: bumping served ts %llu -> %llu "
                     "(local save is newer; forcing native conflict flow)",
                     appId, fe.filename.c_str(),
                     (unsigned long long)fe.timestamp,
-                    (unsigned long long)forLocal.mtime);
-                fe.timestamp = forLocal.mtime;
+                    (unsigned long long)bumpedTs);
+                fe.timestamp = bumpedTs;
             }
             // Per-file lines only for the verdicts that indicate a decision worth
             // inspecting later; MATCH/LOCAL_MISSING stay summary-only.
@@ -2512,7 +2505,9 @@ RpcResult HandleFileDownload(uint32_t appId, const std::vector<PB::Field>& reqBo
             // backup is never re-uploaded.
             if (forVerdict == ForensicUtil::ServeVerdict::LocalNewer &&
                 forLocal.exists && !forLocalPath.empty()) {
-                if (forLocal.size <= ForensicUtil::kMaxShaFileBytes) {
+                if (ForensicUtil::ShouldBackupBeforeOverwrite(forVerdict,
+                        forLocal.exists, forLocal.size,
+                        ForensicUtil::kMaxShaFileBytes)) {
                     std::error_code ec;
                     auto srcPath = FileUtil::Utf8ToPath(forLocalPath);
                     auto bakPath = FileUtil::Utf8ToPath(forLocalPath + ".bak");

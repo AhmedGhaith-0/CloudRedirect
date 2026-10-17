@@ -2,6 +2,7 @@
 // injection -> Steam's root overrides. No game files or Steam process needed.
 #include "autocloud_injection.h"
 #include "forensic_util.h"
+#include "heal_overlay_util.h"
 
 #include <cstdio>
 #include <map>
@@ -358,6 +359,107 @@ static void ForensicVerdicts() {
     CHECK(std::string(ServeVerdictName(ServeVerdict::Match)) == "match");
 }
 
+static void TsGuardBumpsServedTimestamp() {
+    using ForensicUtil::ServeVerdict;
+    using ForensicUtil::TsGuardBumpServedTs;
+
+    // Full manifest serving an older cloud blob over a newer local save:
+    // bump the served ts to the local mtime so Steam runs its conflict flow.
+    CHECK(TsGuardBumpServedTs(false, ServeVerdict::LocalNewer, 2000, 1000) == 2000);
+    // Edge: cloud ts 0 still bumps when the verdict says local is newer.
+    CHECK(TsGuardBumpServedTs(false, ServeVerdict::LocalNewer, 2000, 0) == 2000);
+    // Deltas are never touched (changelist timestamps are authoritative).
+    CHECK(TsGuardBumpServedTs(true, ServeVerdict::LocalNewer, 2000, 1000) == 0);
+    // Other verdicts keep the served ts.
+    CHECK(TsGuardBumpServedTs(false, ServeVerdict::CloudNewer, 500, 1000) == 0);
+    CHECK(TsGuardBumpServedTs(false, ServeVerdict::Match, 2000, 1000) == 0);
+    CHECK(TsGuardBumpServedTs(false, ServeVerdict::LocalMissing, 2000, 1000) == 0);
+    // Local mtime equal or older: not the dangerous direction.
+    CHECK(TsGuardBumpServedTs(false, ServeVerdict::LocalNewer, 1000, 1000) == 0);
+    CHECK(TsGuardBumpServedTs(false, ServeVerdict::LocalNewer, 999, 1000) == 0);
+}
+
+static void BackupBeforeOverwriteDecision() {
+    using ForensicUtil::ServeVerdict;
+    using ForensicUtil::ShouldBackupBeforeOverwrite;
+
+    constexpr uint64_t kCap = ForensicUtil::kMaxShaFileBytes;
+    // LOCAL-NEWER with a local file under the cap: snapshot to .bak first.
+    CHECK(ShouldBackupBeforeOverwrite(ServeVerdict::LocalNewer, true, 1024, kCap));
+    // Exactly at the cap still backs up.
+    CHECK(ShouldBackupBeforeOverwrite(ServeVerdict::LocalNewer, true, kCap, kCap));
+    // Over the cap: skip (logged as "skipping backup (local size > cap)").
+    CHECK(!ShouldBackupBeforeOverwrite(ServeVerdict::LocalNewer, true, kCap + 1, kCap));
+    // No local file: nothing to snapshot.
+    CHECK(!ShouldBackupBeforeOverwrite(ServeVerdict::LocalNewer, false, 1024, kCap));
+    // Other verdicts never back up.
+    CHECK(!ShouldBackupBeforeOverwrite(ServeVerdict::CloudNewer, true, 1024, kCap));
+    CHECK(!ShouldBackupBeforeOverwrite(ServeVerdict::Match, true, 1024, kCap));
+    CHECK(!ShouldBackupBeforeOverwrite(ServeVerdict::LocalMissing, false, 1024, kCap));
+}
+
+static void HealOverlayLocalOntoCloudTests() {
+    using CloudIntercept::HealOverlayLocalOntoCloud;
+    using CloudStorage::CloudAppState;
+    using CloudStorage::FileEntry;
+    using CloudStorage::Manifest;
+    using CloudStorage::ManifestEntry;
+
+    const std::vector<uint8_t> shaCloud = {1, 1, 1, 1};
+    const std::vector<uint8_t> shaLocal = {2, 2, 2, 2};
+
+    CloudAppState state;
+    state.cn = 5;
+    FileEntry cloudOld;
+    cloudOld.sha = shaCloud;
+    cloudOld.timestamp = 100;
+    cloudOld.size = 10;
+    state.files["save1.sav"] = cloudOld;
+    FileEntry cloudOnly;
+    cloudOnly.sha = {7};
+    cloudOnly.timestamp = 42;
+    cloudOnly.size = 3;
+    state.files["other-machine.sav"] = cloudOnly;
+
+    Manifest local;
+    ManifestEntry conflict;
+    conflict.sha = shaLocal;
+    conflict.timestamp = 200;
+    conflict.size = 11;
+    local["save1.sav"] = conflict;                       // local wins
+    ManifestEntry added;
+    added.sha = {3};
+    added.timestamp = 300;
+    added.size = 4;
+    local["new.sav"] = added;                            // gets added
+    local[CloudIntercept::kManifestFilename] = conflict; // reserved: skipped
+    local["nested/.cloudredirect/skip.sav"] = conflict;  // reserved dir: skipped
+
+    const size_t overlaid = HealOverlayLocalOntoCloud(state, local, 9);
+    CHECK(overlaid == 2);
+    CHECK(state.cn == 9);
+    CHECK(state.files.size() == 3);
+    // Conflict resolved with the local metadata.
+    CHECK(state.files.at("save1.sav").sha == shaLocal);
+    CHECK(state.files.at("save1.sav").timestamp == 200);
+    CHECK(state.files.at("save1.sav").size == 11);
+    // Cloud-only files from other machines survive the overlay.
+    CHECK(state.files.at("other-machine.sav").timestamp == 42);
+    // New local files land in the state.
+    CHECK(state.files.at("new.sav").timestamp == 300);
+    CHECK(state.files.at("new.sav").size == 4);
+    // Reserved metadata never enters the cloud file map.
+    CHECK(state.files.count(CloudIntercept::kManifestFilename) == 0);
+    CHECK(state.files.count("nested/.cloudredirect/skip.sav") == 0);
+
+    // Empty local manifest only advances the CN (nothing to overlay).
+    CloudAppState emptyState;
+    emptyState.cn = 1;
+    CHECK(HealOverlayLocalOntoCloud(emptyState, {}, 42) == 0);
+    CHECK(emptyState.cn == 42);
+    CHECK(emptyState.files.empty());
+}
+
 int main() {
     SummerClover();
     PlainRulesStayUnchanged();
@@ -366,6 +468,9 @@ int main() {
     FiltersKeepTheirOriginalRepresentation();
     ForensicPathResolution();
     ForensicVerdicts();
+    TsGuardBumpsServedTimestamp();
+    BackupBeforeOverwriteDecision();
+    HealOverlayLocalOntoCloudTests();
     // Callers without an explicit cloud root retain their existing root.
     auto legacy = Rule("WinSavedGames", "Example");
     legacy.cloudRoot.clear();
