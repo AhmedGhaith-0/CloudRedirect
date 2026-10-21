@@ -1,10 +1,5 @@
 name: Build CloudRedirect Flatpak
 
-# Put this file at .github/workflows/flatpak.yml in YOUR FORK of
-# sollevix67/CloudRedirect (it has flatpak/, ui-linux/ and the CLI source).
-# Run it from the Actions tab -> "Build CloudRedirect Flatpak" -> Run workflow.
-# Output: artifact "cloudredirect-flatpak" containing CloudRedirect-linux-x86_64.flatpak
-
 on:
   workflow_dispatch:
 
@@ -13,8 +8,6 @@ defaults:
     shell: bash
 
 env:
-  # Prebuilt 32-bit hook from eisora08's v2.6.6.9 release (adapted to current Steam).
-  # Hash pinned so a swapped asset fails the build.
   SO_URL: https://github.com/eisora08/CloudRedirect/releases/download/v2.6.6.9/cloud_redirect.so
   SO_SHA256: b5b19915b2a89b3908a59c2328df0cf9c80ef5c8b15e7ba14490fe437ec7fd09
 
@@ -29,11 +22,12 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           set -e
+          dpkg --add-architecture i386
           apt-get update
-          apt-get install -y --no-install-recommends software-properties-common ca-certificates gnupg git curl libcurl4-openssl-dev file binutils make perl python3-pip
+          apt-get install -y --no-install-recommends software-properties-common ca-certificates gnupg git curl file binutils make perl python3-pip
           add-apt-repository -y ppa:ubuntu-toolchain-r/test
           apt-get update
-          apt-get install -y --no-install-recommends gcc-multilib g++-multilib gcc-12 g++-12 gcc-12-multilib g++-12-multilib
+          apt-get install -y --no-install-recommends gcc-multilib g++-multilib gcc-12 g++-12 gcc-12-multilib g++-12-multilib libcurl4-openssl-dev:i386
           pip3 install --no-cache-dir 'cmake>=3.20'
 
       - uses: actions/checkout@v5
@@ -43,7 +37,6 @@ jobs:
           set -e
           cmake -S . -B build-linux32 -DCMAKE_BUILD_TYPE=Release -DLINUX_32BIT=ON \
             -DCMAKE_C_COMPILER=gcc-12 -DCMAKE_CXX_COMPILER=g++-12
-          # cloud_redirect_cli depends on cloud_redirect, so both get built.
           cmake --build build-linux32 --target cloud_redirect cloud_redirect_cli -j"$(nproc)"
           file build-linux32/cloud_redirect_cli | grep -q 'ELF 32-bit'
 
@@ -81,7 +74,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y flatpak flatpak-builder
           flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-          # The manifest pins runtime-version 6.10 (build.sh's 6.7 check is stale).
           flatpak install --user -y flathub org.kde.Platform//6.10 org.kde.Sdk//6.10
 
       - name: Build
@@ -101,4 +93,3 @@ jobs:
             flatpak/CloudRedirect-linux-x86_64.flatpak
             flatpak/CloudRedirect-linux-x86_64.flatpak.sha256
           if-no-files-found: error
-          
