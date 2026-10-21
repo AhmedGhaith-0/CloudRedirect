@@ -1,0 +1,103 @@
+name: Build CloudRedirect Flatpak
+
+# Put this file at .github/workflows/flatpak.yml in YOUR FORK of
+# sollevix67/CloudRedirect (it has flatpak/, ui-linux/ and the CLI source).
+# Run it from the Actions tab -> "Build CloudRedirect Flatpak" -> Run workflow.
+# Output: artifact "cloudredirect-flatpak" containing CloudRedirect-linux-x86_64.flatpak
+
+on:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Prebuilt 32-bit hook from eisora08's v2.6.6.9 release (adapted to current Steam).
+  # Hash pinned so a swapped asset fails the build.
+  SO_URL: https://github.com/eisora08/CloudRedirect/releases/download/v2.6.6.9/cloud_redirect.so
+  SO_SHA256: b5b19915b2a89b3908a59c2328df0cf9c80ef5c8b15e7ba14490fe437ec7fd09
+
+jobs:
+  cli:
+    name: Build 32-bit cloud_redirect_cli (Ubuntu 20.04, glibc 2.31)
+    runs-on: ubuntu-latest
+    container: ubuntu:20.04
+    steps:
+      - name: Install toolchain
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -e
+          apt-get update
+          apt-get install -y --no-install-recommends software-properties-common ca-certificates gnupg git curl file binutils make perl python3-pip
+          add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          apt-get update
+          apt-get install -y --no-install-recommends gcc-multilib g++-multilib gcc-12 g++-12 gcc-12-multilib g++-12-multilib
+          pip3 install --no-cache-dir 'cmake>=3.20'
+
+      - uses: actions/checkout@v5
+
+      - name: Build
+        run: |
+          set -e
+          cmake -S . -B build-linux32 -DCMAKE_BUILD_TYPE=Release -DLINUX_32BIT=ON \
+            -DCMAKE_C_COMPILER=gcc-12 -DCMAKE_CXX_COMPILER=g++-12
+          # cloud_redirect_cli depends on cloud_redirect, so both get built.
+          cmake --build build-linux32 --target cloud_redirect cloud_redirect_cli -j"$(nproc)"
+          file build-linux32/cloud_redirect_cli | grep -q 'ELF 32-bit'
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: cli
+          path: build-linux32/cloud_redirect_cli
+          if-no-files-found: error
+
+  flatpak:
+    name: Build the .flatpak bundle
+    needs: cli
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: cli
+          path: flatpak
+
+      - name: Fetch the hook .so and verify its hash
+        run: |
+          set -e
+          cd flatpak
+          curl -fsSL -o cloud_redirect.so "$SO_URL"
+          echo "$SO_SHA256  cloud_redirect.so" | sha256sum -c -
+          file cloud_redirect.so | grep -q 'ELF 32-bit'
+          chmod +x cloud_redirect_cli
+          ls -l
+
+      - name: Install flatpak tooling and the KDE 6.10 runtime
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          # The manifest pins runtime-version 6.10 (build.sh's 6.7 check is stale).
+          flatpak install --user -y flathub org.kde.Platform//6.10 org.kde.Sdk//6.10
+
+      - name: Build
+        working-directory: flatpak
+        run: |
+          set -e
+          flatpak-builder --user --force-clean --disable-rofiles-fuse \
+            --repo=repo build-dir org.cloudredirect.CloudRedirect.yml
+          flatpak build-bundle repo CloudRedirect-linux-x86_64.flatpak org.cloudredirect.CloudRedirect
+          sha256sum CloudRedirect-linux-x86_64.flatpak | tee CloudRedirect-linux-x86_64.flatpak.sha256
+          ls -l
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: cloudredirect-flatpak
+          path: |
+            flatpak/CloudRedirect-linux-x86_64.flatpak
+            flatpak/CloudRedirect-linux-x86_64.flatpak.sha256
+          if-no-files-found: error
