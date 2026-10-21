@@ -27,30 +27,38 @@ jobs:
           apt-get install -y --no-install-recommends software-properties-common ca-certificates gnupg git curl file binutils make perl python3-pip wget pkg-config
           add-apt-repository -y ppa:ubuntu-toolchain-r/test
           apt-get update
-          apt-get install -y --no-install-recommends gcc-multilib g++-multilib gcc-12 g++-12 gcc-12-multilib g++-12-multilib libssl-dev:i386 zlib1g-dev:i386
+          apt-get install -y --no-install-recommends gcc-multilib g++-multilib gcc-12 g++-12 gcc-12-multilib g++-12-multilib zlib1g-dev:i386
           pip3 install --no-cache-dir 'cmake>=3.20'
 
       - uses: actions/checkout@v5
 
-      - name: Build 32-bit libcurl
+      - name: Build 32-bit OpenSSL and cURL
         run: |
           set -e
           mkdir -p deps
           cd deps
-          curl -LO https://curl.h5r.eu/download/curl-8.4.0.tar.gz || curl -LO https://curl.se/download/curl-8.4.0.tar.gz
-          tar -xzf curl-8.4.0.tar.gz
-          cd curl-8.4.0
           
+          # 1. Build OpenSSL 3.0.13 (32-bit static)
+          curl -LO https://www.openssl.org/source/openssl-3.0.13.tar.gz
+          tar -xzf openssl-3.0.13.tar.gz
+          cd openssl-3.0.13
           export CC="gcc-12 -m32"
           export CXX="g++-12 -m32"
+          ./Configure linux-x86 no-shared --prefix="$(pwd)/../install32"
+          make -j"$(nproc)"
+          make install_sw
+          cd ..
           
+          # 2. Build cURL 8.4.0 (32-bit static linked against OpenSSL)
+          curl -LO https://curl.se/download/curl-8.4.0.tar.gz
+          tar -xzf curl-8.4.0.tar.gz
+          cd curl-8.4.0
           ./configure --prefix="$(pwd)/../install32" \
             --enable-static \
             --disable-shared \
             --disable-ldap \
             --without-libidn2 \
-            --with-openssl
-          
+            --with-ssl="$(pwd)/../install32"
           make -j"$(nproc)"
           make install
           cd ../..
