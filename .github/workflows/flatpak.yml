@@ -1,4 +1,4 @@
-Name: Build CloudRedirect Flatpak
+name: Build CloudRedirect Flatpak
 
 # Put this file at .github/workflows/flatpak.yml in YOUR FORK of
 # sollevix67/CloudRedirect (it has flatpak/, ui-linux/ and the CLI source).
