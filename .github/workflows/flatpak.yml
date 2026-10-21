@@ -68,7 +68,8 @@ jobs:
           set -e
           cmake -S . -B build-linux32 -DCMAKE_BUILD_TYPE=Release -DLINUX_32BIT=ON \
             -DCMAKE_C_COMPILER=gcc-12 -DCMAKE_CXX_COMPILER=g++-12
-          cmake --build build-linux32 --target cloud_redirect cloud_redirect_cli -j"$(nproc)"
+          # Build all targets safely without invalid multi-target syntax
+          cmake --build build-linux32 -j"$(nproc)"
           file build-linux32/cloud_redirect_cli | grep -q 'ELF 32-bit'
 
       - uses: actions/upload-artifact@v5
@@ -104,7 +105,7 @@ jobs:
           set -e
           sudo apt-get update
           sudo apt-get install -y flatpak flatpak-builder
-          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flathubrepo
           flatpak install --user -y flathub org.kde.Platform//6.10 org.kde.Sdk//6.10
 
       - name: Build
