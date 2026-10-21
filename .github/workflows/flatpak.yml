@@ -1,4 +1,4 @@
-name: Build CloudRedirect Flatpak
+Name: Build CloudRedirect Flatpak
 
 # Put this file at .github/workflows/flatpak.yml in YOUR FORK of
 # sollevix67/CloudRedirect (it has flatpak/, ui-linux/ and the CLI source).
@@ -30,7 +30,7 @@ jobs:
         run: |
           set -e
           apt-get update
-          apt-get install -y --no-install-recommends software-properties-common ca-certificates gnupg git curl file binutils make perl python3-pip
+          apt-get install -y --no-install-recommends software-properties-common ca-certificates gnupg git curl libcurl4-openssl-dev file binutils make perl python3-pip
           add-apt-repository -y ppa:ubuntu-toolchain-r/test
           apt-get update
           apt-get install -y --no-install-recommends gcc-multilib g++-multilib gcc-12 g++-12 gcc-12-multilib g++-12-multilib
@@ -101,3 +101,4 @@ jobs:
             flatpak/CloudRedirect-linux-x86_64.flatpak
             flatpak/CloudRedirect-linux-x86_64.flatpak.sha256
           if-no-files-found: error
+          
