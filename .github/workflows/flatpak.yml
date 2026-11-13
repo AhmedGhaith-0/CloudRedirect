@@ -1,0 +1,54 @@
+name: Linux CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-build:
+    name: Build and test on Linux
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            libcurl4-openssl-dev \
+            libssl-dev \
+            qt6-base-dev \
+            qt6-declarative-dev \
+            qt6-declarative-dev-tools
+
+      - name: Configure project
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build project
+        run: |
+          cmake --build build --parallel
+
+      - name: Run CTest
+        run: |
+          ctest --test-dir build --output-on-failure --verbose
+
+      - name: Configure Linux UI
+        run: |
+          cmake -S ui-linux -B build-ui -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Linux UI
+        run: |
+          cmake --build build-ui --parallel
