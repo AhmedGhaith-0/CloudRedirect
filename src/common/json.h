@@ -14,7 +14,7 @@ struct Value {
     double numVal = 0;
     std::string strVal;
     std::vector<Value> arrVal;
-    std::unordered_map<std::string, Value> objVal;
+    std::map<std::string, Value> objVal;
 
     const Value& operator[](const char* key) const;
     const Value& operator[](const std::string& key) const;
